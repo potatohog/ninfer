@@ -220,10 +220,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int d1            = d0 + 32;
             const std::int64_t src0 = gqa_kv_new_index<Geometry>(kv_head, d0, token);
             const std::int64_t src1 = gqa_kv_new_index<Geometry>(kv_head, d1, token);
-            const float kv0         = __bfloat162float(input.k[src0]);
-            const float kv1         = __bfloat162float(input.k[src1]);
-            const float vv0         = __bfloat162float(input.v[src0]);
-            const float vv1         = __bfloat162float(input.v[src1]);
+            float kv0           = __bfloat162float(input.k[src0]);
+            float kv1           = __bfloat162float(input.k[src1]);
+            float vv0           = __bfloat162float(input.v[src0]);
+            float vv1           = __bfloat162float(input.v[src1]);
             // The fused append encodes the rotated group; the lane pair (i, i+32) is
             // the in-warp FWHT layout, so both rotations are warp-local butterflies.
             hadamard64_warp_pair(kv0, kv1, lane, FullMask);
@@ -269,8 +269,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         int q_head    = 0;
         int token     = 0;
         gqa_small_t_tc_row_to_qt<Geometry>(row, TokenTile, kv_head, q_head, token);
-        const float x0  = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d0, token)]);
-        const float x1  = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d1, token)]);
+        float x0   = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d0, token)]);
+        float x1   = __bfloat162float(q[gqa_q_index<Geometry>(q_head, d1, token)]);
         // Q8-G64 encodes the rotated query row group.
         hadamard64_warp_pair(x0, x1, lane, FullMask);
         float amax      = fmaxf(fabsf(x0), fabsf(x1));

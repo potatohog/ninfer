@@ -111,10 +111,10 @@ __launch_bounds__(256) __global__
 
     const std::int64_t src0 = gqa_kv_quant_src_index<Geometry>(kv_head, d0, token);
     const std::int64_t src1 = gqa_kv_quant_src_index<Geometry>(kv_head, d1, token);
-    const float k0          = __bfloat162float(k[src0]);
-    const float k1          = __bfloat162float(k[src1]);
-    const float v0          = __bfloat162float(v[src0]);
-    const float v1          = __bfloat162float(v[src1]);
+    float k0                = __bfloat162float(k[src0]);
+    float k1                = __bfloat162float(k[src1]);
+    float v0                = __bfloat162float(v[src0]);
+    float v1                = __bfloat162float(v[src1]);
 
     // INT8-G64 encodes the rotated group; the lane pair (i, i+32) is exactly the
     // in-warp FWHT layout, so the rotation is a warp-local butterfly.
