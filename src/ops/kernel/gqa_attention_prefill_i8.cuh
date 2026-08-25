@@ -619,11 +619,11 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
 // warp owns one (row, group) task and applies the self-inverse transform in place.
 // Rows the attention kernel zeroed stay zero.
 template <typename Geometry>
-__launch_bounds__(128) __global__ void gqa_prefill_i8_unrotate_kernel(__nv_bfloat16* __restrict__ out,
+__launch_bounds__(256) __global__ void gqa_prefill_i8_unrotate_kernel(__nv_bfloat16* __restrict__ out,
                                                                      std::int32_t tokens) {
     constexpr unsigned FullMask = 0xffffffffu;
     const int q_head = static_cast<int>(blockIdx.x);
-    const int row    = static_cast<int>(blockIdx.y) * 4 + (static_cast<int>(threadIdx.x) >> 5);
+    const int row    = static_cast<int>(blockIdx.y) * 8 + (static_cast<int>(threadIdx.x) >> 5);
     const int lane   = static_cast<int>(threadIdx.x) & 31;
     if (row >= tokens) { return; }
 #pragma unroll
