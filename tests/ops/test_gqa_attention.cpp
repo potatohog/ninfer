@@ -946,8 +946,9 @@ void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vect
         k[kv_input_index(geometry, 0, d, 0)]               = 0.0f;
         v[kv_input_index(geometry, 0, kQuantGroup + d, 0)] = 0.0f;
     }
-    // A uniform 64-group rotates to exactly (±1, 0, ..., 0): the rotated absmax is
-    // one, so the first code lands exactly on the signed clamp boundary.
+    // A uniform 64-group rotates to exactly (±1, 0, ..., 0): the rotated absmax is one,
+    // so the first code lands exactly on the max code value (127); the codec
+    // clamp(·, −127, 127) itself is never exercised for a correctly computed RNE scale.
     for (std::int32_t d = 0; d < kQuantGroup; ++d) {
         k[kv_input_index(geometry, geometry.kv_heads - 1, d, tokens - 1)] = 0.125f;
         v[kv_input_index(geometry, geometry.kv_heads - 1, d, tokens - 1)] = -0.125f;

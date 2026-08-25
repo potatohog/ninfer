@@ -262,6 +262,10 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         // group's full output row; stage it, undo the self-inverse rotation, and
         // publish both halves. Masked rows are exact zero and rotate to zero.
         static_assert(DChunk == 64, "INT8 reduce epilogue requires one 64-d group per CTA");
+        // Every live thread read head_l (reduce[0]) above; order those reads before any
+        // staged write to reduce[tid] so the memory model, not just timing, guarantees no
+        // reader observes a staged value instead of head_l.
+        __syncthreads();
         reduce[tid] = value;
         __syncthreads();
         if (tid < DChunk / 2) {
