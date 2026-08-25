@@ -35,9 +35,15 @@ constexpr ReductionCriterion kAttentionBf16Criterion{
     /*gross_relative_to_max_reference*/ 2.7e-3,
 };
 
+// The INT8 envelope is calibrated to the per-64 Hadamard-domain codec on this fixture. Rotation
+// raises the group absmax on flat data (rotated values are more Gaussian, ~1.3x the raw uniform
+// absmax, widening the FP16-scaled quantization step), and the output un-rotation aggregates a
+// group's 64 code errors into every output element, so the worst per-element tail is ~2x the
+// pre-rotation direct-quantization tail. Calibrated to the measured worst cases: relative_l2
+// 3.19e-3 (qwen3_6_27b cached T=1 keys=129) and gross 5.36e-3 (qwen3_6_35b_a3b batch B=8 W=1).
 constexpr ReductionCriterion kAttentionInt8Criterion{
-    /*relative_l2*/ 3.15e-3,
-    /*gross_absolute*/ 1.1e-3,
+    /*relative_l2*/ 3.5e-3,
+    /*gross_absolute*/ 3.5e-3,
     /*gross_relative_to_max_reference*/ 2.2e-3,
 };
 
