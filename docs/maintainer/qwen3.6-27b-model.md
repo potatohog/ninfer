@@ -382,11 +382,15 @@ remain consistent.
 - the ideal GQA oracle evaluates dot products, stable softmax, and value reduction in FP64 from
   BF16 Q and logical cache values; the BF16 Op output is promoted to FP64 for comparison;
 - low-bit weight storage changes representation, not the intended dequantized matrix;
-- INT8-G64 KV stores FP16 scales and signed codes, and its ideal logical K/V values are their FP32
-  decode;
-- the target's INT8 attention path intentionally quantizes Q to Q8-G64 for production computation;
-  this native compute profile does not replace BF16 Q in the common ideal oracle, and its delta is
-  accepted through the separate named INT8-cache compute-profile criterion;
+- INT8-G64 KV stores FP16 scales and signed codes of the per-64-group Hadamard-rotated value
+  (Sylvester H64 applied with scale 1/8, self-inverse and dot-product preserving), and its ideal
+  logical K/V values are the FP32 decode of those codes in the rotated domain; the oracle rotates
+  BF16 Q and the logical K/V groups with the same transform and un-rotates the reduced value
+  before comparison;
+- the target's INT8 attention path intentionally quantizes the rotated query to Q8-G64 for
+  production computation; this native compute profile does not replace BF16 Q in the common ideal
+  oracle, and its delta is accepted through the separate named INT8-cache compute-profile
+  criterion;
 - the full target `lm_head` is used for prefill, verification, and ordinary decode regardless of
   draft-head mode.
 

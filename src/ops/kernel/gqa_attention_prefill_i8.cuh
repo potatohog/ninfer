@@ -11,6 +11,7 @@
 
 #include "ops/kernel/gqa_attention_kv_quant.cuh"
 #include "ops/kernel/gqa_attention_prefill_common.cuh"
+#include "ops/kernel/hadamard64.cuh"
 
 #include <cstdint>
 
@@ -115,6 +116,11 @@ __launch_bounds__(256) __global__
     const float v0          = __bfloat162float(v[src0]);
     const float v1          = __bfloat162float(v[src1]);
 
+    // INT8-G64 encodes the rotated group; the lane pair (i, i+32) is exactly the
+    // in-warp FWHT layout, so the rotation is a warp-local butterfly.
+    hadamard64_warp_pair(k0, k1, lane, FullMask);
+    hadamard64_warp_pair(v0, v1, lane, FullMask);
+
     float k_abs = fmaxf(fabsf(k0), fabsf(k1));
     float v_abs = fmaxf(fabsf(v0), fabsf(v1));
     k_abs       = warp_max(k_abs, FullMask);
@@ -181,6 +187,10 @@ __launch_bounds__(256) __global__ void gqa_attention_prefill_fill_i8_page_kernel
         v0                      = __bfloat162float(v[src0]);
         v1                      = __bfloat162float(v[src1]);
     }
+    // Tail warps hold the all-zero group; rotating the full zero-padded 64-vector is
+    // the required codec input, so the butterfly runs over the whole warp.
+    hadamard64_warp_pair(k0, k1, lane, FullMask);
+    hadamard64_warp_pair(v0, v1, lane, FullMask);
     const float k_abs = warp_max(fmaxf(fabsf(k0), fabsf(k1)), FullMask);
     const float v_abs = warp_max(fmaxf(fabsf(v0), fabsf(v1)), FullMask);
     const __half ksh  = __float2half_rn(k_abs > 0.0f ? k_abs / 127.0f : 0.0f);
@@ -286,6 +296,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
             x0 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d0, q0 + row)]);
             x1 = __bfloat162float(q[gqa_prefill_q_index<Geometry>(q_head, d1, q0 + row)]);
         }
+        // Q8-G64 encodes the rotated query; zero-padded rows rotate to zero.
+        hadamard64_warp_pair(x0, x1, lane, FullMask);
         float absmax    = fmaxf(fabsf(x0), fabsf(x1));
         absmax          = warp_max(absmax, FullMask);
         const float qs  = absmax > 0.0f ? absmax / 127.0f : 0.0f;
@@ -600,6 +612,30 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     }
     gqa_prefill_zero_output_rows<Geometry>(out, q_head, tokens, min(q0 + Br, width), tid,
                                            kGqaPrefillI8Threads);
+}
+
+// Undo the per-64-group Hadamard rotation on the INT8 prompt attention output. The
+// attention kernel publishes every addressed output row in the rotated domain; one
+// warp owns one (row, group) task and applies the self-inverse transform in place.
+// Rows the attention kernel zeroed stay zero.
+template <typename Geometry>
+__launch_bounds__(128) __global__ void gqa_prefill_i8_unrotate_kernel(__nv_bfloat16* __restrict__ out,
+                                                                     std::int32_t tokens) {
+    constexpr unsigned FullMask = 0xffffffffu;
+    const int q_head = static_cast<int>(blockIdx.x);
+    const int row    = static_cast<int>(blockIdx.y) * 4 + (static_cast<int>(threadIdx.x) >> 5);
+    const int lane   = static_cast<int>(threadIdx.x) & 31;
+    if (row >= tokens) { return; }
+#pragma unroll
+    for (int grp = 0; grp < kGqaPrefillI8Groups; ++grp) {
+        const int d0 = grp * kGqaKvQuantGroup + lane;
+        const int d1 = d0 + 32;
+        float x0     = __bfloat162float(out[gqa_prefill_q_index<Geometry>(q_head, d0, row)]);
+        float x1     = __bfloat162float(out[gqa_prefill_q_index<Geometry>(q_head, d1, row)]);
+        hadamard64_warp_pair(x0, x1, lane, FullMask);
+        out[gqa_prefill_q_index<Geometry>(q_head, d0, row)] = __float2bfloat16(x0);
+        out[gqa_prefill_q_index<Geometry>(q_head, d1, row)] = __float2bfloat16(x1);
+    }
 }
 
 } // namespace ninfer::ops

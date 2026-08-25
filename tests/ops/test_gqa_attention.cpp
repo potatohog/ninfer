@@ -4,6 +4,7 @@
 #include "ops/op_tester.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -313,6 +314,40 @@ std::int32_t round_even_to_i32(float value) {
     return (lower & 1) == 0 ? lower : lower + 1;
 }
 
+// Sylvester Hadamard rotation y = H64 x / 8 by the iterative butterfly (stages
+// h = 1..32, pair (j, j+h) with j&h == 0: (a, b) -> (a + b, a - b)), FP32 with the
+// device's per-stage operand order. This mirror is bit-exact with
+// hadamard64_warp_pair, so the host codec oracle reproduces the device's rotated
+// values exactly.
+void hadamard64_fp32(float* g) {
+    for (int h = 1; h < kQuantGroup; h <<= 1) {
+        for (int j = 0; j < kQuantGroup; ++j) {
+            if ((j & h) == 0) {
+                const float a = g[j];
+                const float b = g[j + h];
+                g[j]    = a + b;
+                g[j + h] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < kQuantGroup; ++i) { g[i] *= 0.125f; }
+}
+
+// Same rotation in FP64 for the ideal-attention oracle.
+void hadamard64_fp64(double* g) {
+    for (int h = 1; h < kQuantGroup; h <<= 1) {
+        for (int j = 0; j < kQuantGroup; ++j) {
+            if ((j & h) == 0) {
+                const double a = g[j];
+                const double b = g[j + h];
+                g[j]    = a + b;
+                g[j + h] = a - b;
+            }
+        }
+    }
+    for (int i = 0; i < kQuantGroup; ++i) { g[i] *= 0.125; }
+}
+
 struct HostCache {
     Geometry geometry;
     DType dtype;
@@ -329,9 +364,16 @@ struct HostCache {
 void encode_group(const std::vector<float>& source, std::size_t source_base,
                   std::vector<std::int8_t>& codes, std::size_t code_base,
                   std::vector<std::uint16_t>& scales, std::size_t scale_offset) {
+    // The INT8-G64 codec encodes the Hadamard-rotated 64-group.
+    float rotated[kQuantGroup];
+    for (std::int32_t i = 0; i < kQuantGroup; ++i) {
+        rotated[i] = source[source_base + static_cast<std::size_t>(i)];
+    }
+    hadamard64_fp32(rotated);
+
     float absmax = 0.0f;
     for (std::int32_t i = 0; i < kQuantGroup; ++i) {
-        absmax = std::max(absmax, std::abs(source[source_base + static_cast<std::size_t>(i)]));
+        absmax = std::max(absmax, std::abs(rotated[i]));
     }
 
     const float unrounded_scale    = absmax / 127.0f;
@@ -342,7 +384,7 @@ void encode_group(const std::vector<float>& source, std::size_t source_base,
     for (std::int32_t i = 0; i < kQuantGroup; ++i) {
         std::int32_t code = 0;
         if (stored_scale != 0.0f) {
-            const float scaled = source[source_base + static_cast<std::size_t>(i)] * inverse_scale;
+            const float scaled = rotated[i] * inverse_scale;
             code               = std::clamp(round_even_to_i32(scaled), -127, 127);
         }
         codes[code_base + static_cast<std::size_t>(i)] = static_cast<std::int8_t>(code);
@@ -432,6 +474,7 @@ double cache_value(const HostCache& cache, bool key, std::int32_t head, std::int
 std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache& cache,
                                     const std::vector<std::int32_t>& positions) {
     const Geometry& geometry  = cache.geometry;
+    const bool rotated        = cache.dtype == DType::I8;
     const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
     std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
                                static_cast<std::size_t>(geometry.q_heads) *
@@ -439,15 +482,28 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
 
     std::vector<double> scores(static_cast<std::size_t>(positions.back()) + 1);
     std::vector<double> probabilities(scores.size());
+    std::array<double, kHeadDim> q_row{};
+    std::array<double, kHeadDim> out_row{};
     for (std::int32_t token = 0; token < tokens; ++token) {
         const std::int32_t visible = positions[static_cast<std::size_t>(token)] + 1;
         for (std::int32_t q_head = 0; q_head < geometry.q_heads; ++q_head) {
             const std::int32_t kv_head = q_head / geometry.query_group();
+            // The INT8 cache stores rotated K/V codes; the oracle rotates BF16 Q with the
+            // same transform so every dot product runs over rotation-equivalent operands.
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                q_row[static_cast<std::size_t>(d)] =
+                    static_cast<double>(q[q_index(geometry, q_head, d, token)]);
+            }
+            if (rotated) {
+                for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+                    hadamard64_fp64(q_row.data() + static_cast<std::size_t>(group) * kQuantGroup);
+                }
+            }
             double max_score           = -std::numeric_limits<double>::infinity();
             for (std::int32_t position = 0; position < visible; ++position) {
                 double dot = 0.0;
                 for (std::int32_t d = 0; d < kHeadDim; ++d) {
-                    dot += static_cast<double>(q[q_index(geometry, q_head, d, token)]) *
+                    dot += q_row[static_cast<std::size_t>(d)] *
                            cache_value(cache, true, kv_head, position, d);
                 }
                 const double score = dot * static_cast<double>(kAttentionScale);
@@ -472,7 +528,18 @@ std::vector<double> ideal_attention(const std::vector<float>& q, const HostCache
                     value += probabilities[static_cast<std::size_t>(position)] *
                              cache_value(cache, false, kv_head, position, d);
                 }
-                output[q_index(geometry, q_head, d, token)] = value;
+                out_row[static_cast<std::size_t>(d)] = value;
+            }
+            if (rotated) {
+                // Undo the rotation of the reduced value before publishing it.
+                for (std::int32_t group = 0; group < kQuantGroups; ++group) {
+                    hadamard64_fp64(out_row.data() +
+                                    static_cast<std::size_t>(group) * kQuantGroup);
+                }
+            }
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                output[q_index(geometry, q_head, d, token)] =
+                    out_row[static_cast<std::size_t>(d)];
             }
         }
     }
@@ -868,12 +935,17 @@ std::string case_label(const char* entry, const Geometry& geometry, DType dtype,
 void inject_codec_edges(const Geometry& geometry, std::int32_t tokens, std::vector<float>& k,
                         std::vector<float>& v) {
     if (tokens == 0) return;
+    // Exact zero group: scale_bits = 0 and the all-zero code path.
     for (std::int32_t d = 0; d < kQuantGroup; ++d) {
         k[kv_input_index(geometry, 0, d, 0)]               = 0.0f;
         v[kv_input_index(geometry, 0, kQuantGroup + d, 0)] = 0.0f;
     }
-    k[kv_input_index(geometry, geometry.kv_heads - 1, 0, tokens - 1)] = -1.0f;
-    v[kv_input_index(geometry, geometry.kv_heads - 1, 0, tokens - 1)] = 1.0f;
+    // A uniform 64-group rotates to exactly (±1, 0, ..., 0): the rotated absmax is
+    // one, so the first code lands exactly on the signed clamp boundary.
+    for (std::int32_t d = 0; d < kQuantGroup; ++d) {
+        k[kv_input_index(geometry, geometry.kv_heads - 1, d, tokens - 1)] = 0.125f;
+        v[kv_input_index(geometry, geometry.kv_heads - 1, d, tokens - 1)] = -0.125f;
+    }
 }
 
 int run_append_case(const Geometry& geometry, DType dtype, MappingPattern mapping,

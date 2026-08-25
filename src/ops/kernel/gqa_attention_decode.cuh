@@ -10,6 +10,7 @@
 #include "ops/common/mma.cuh"
 #include "ops/common/warp.cuh"
 #include "ops/kernel/gqa_attention_geometry.cuh"
+#include "ops/kernel/hadamard64.cuh"
 #include "ops/kernel/paged_kv_address.cuh"
 
 #include <cuda_bf16.h>
@@ -255,7 +256,26 @@ __launch_bounds__(256) __global__ void gqa_attention_small_t_reduce_output_kerne
         valid = absolute_column < valid_columns[batch];
     }
     const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
-    out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    if constexpr (Int8) {
+        // The INT8 route accumulates the value reduction in the Hadamard domain. This
+        // CTA owns exactly one 64-d group (DChunk == 64), so threads 0..63 hold the
+        // group's full output row; stage it, undo the self-inverse rotation, and
+        // publish both halves. Masked rows are exact zero and rotate to zero.
+        static_assert(DChunk == 64, "INT8 reduce epilogue requires one 64-d group per CTA");
+        reduce[tid] = value;
+        __syncthreads();
+        if (tid < DChunk / 2) {
+            float lo = reduce[tid];
+            float hi = reduce[tid + DChunk / 2];
+            hadamard64_warp_pair(lo, hi, tid, kFullWarpMask);
+            out[gqa_q_index<Geometry>(q_head, d_start + tid, output_column)] =
+                __float2bfloat16(lo);
+            out[gqa_q_index<Geometry>(q_head, d_start + tid + DChunk / 2, output_column)] =
+                __float2bfloat16(hi);
+        }
+    } else {
+        out[gqa_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
+    }
 }
 
 } // namespace ninfer::ops

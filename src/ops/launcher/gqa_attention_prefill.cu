@@ -44,6 +44,12 @@ void gqa_attention_prompt_attention_launch_for(const Tensor& q, const Tensor& po
                 static_cast<const __half*>(cache_v_scale.data), metadata,
                 static_cast<const std::int32_t*>(positions.data), scale,
                 static_cast<__nv_bfloat16*>(out.data), tokens);
+        // The INT8 prompt attention publishes each output row in the Hadamard
+        // domain; undo the per-64-group rotation in place.
+        const dim3 unrotate_grid(static_cast<unsigned>(Geometry::QHeads),
+                                 static_cast<unsigned>(div_up(tokens, 4)), 1u);
+        gqa_prefill_i8_unrotate_kernel<Geometry><<<unrotate_grid, 128, 0, stream>>>(
+            static_cast<__nv_bfloat16*>(out.data), tokens);
     } else {
         const dim3 attention_grid(static_cast<unsigned>(div_up(tokens, kGqaPrefillBr)),
                                   static_cast<unsigned>(Geometry::QHeads), 1u);

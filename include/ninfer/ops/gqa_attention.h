@@ -21,26 +21,41 @@ struct GqaExecutionEnvelope {
  * Shared numerical contract for A1/A2/A3.
  *
  * Public q/k/v inputs and BF16 cache values are interpreted after their BF16 storage boundary.
- * INT8-G64 cache rows use one FP16 scale for each contiguous 64-element group. For BF16 source
- * values x, their exact observable encoding is:
+ * The INT8 route additionally operates in a fixed Hadamard rotation domain. For one contiguous
+ * 64-element group, let H64 be the 64x64 Sylvester Walsh-Hadamard matrix and rot(x) = H64 x / 8,
+ * evaluated by the iterative butterfly (stages h = 1, 2, 4, 8, 16, 32; pair (j, j+h) with
+ * j&h == 0: (a, b) -> (a + b, a - b)) in FP32. H64 is orthonormal and self-inverse
+ * (H64 H64 = 64 I), so rot is its own inverse and preserves Euclidean dot products. Every K/V
+ * group is rotated before INT8-G64 encoding, every query row is rotated before Q8-G64 encoding,
+ * and the attention output is un-rotated after the value reduction. The rotation is a property
+ * of the INT8 cache dtype: BF16 cache rows, BF16 Q, and the BF16 compute path carry no
+ * rotation, and an INT8 cache row written by A1 or A2 is only readable through this Op's INT8
+ * route.
  *
- *   a          = max_i abs(FP32(x[i]))
+ * INT8-G64 cache rows use one FP16 scale for each contiguous 64-element group of rotated source
+ * values r = rot(x). For BF16 source values x, their exact observable encoding is:
+ *
+ *   a          = max_i abs(r[i])
  *   scale_bits = FP16_RNE(a / 127)
  *   s          = FP32(scale_bits)
  *   inv        = s == 0 ? 0 : FP32(1 / s)
- *   code[i]    = s == 0 ? 0 : I8(clamp(RNE_even(FP32(x[i]) * inv), -127, 127))
- *   decode[i]  = FP32(code[i]) * s
+ *   code[i]    = s == 0 ? 0 : I8(clamp(RNE_even(FP32(r[i]) * inv), -127, 127))
+ *   decode[i]  = FP32(code[i]) * s        (rotated domain)
  *
  * A1 and A2 produce identical code and scale bits. The common ideal attention oracle uses BF16 Q
- * and logical cache values (BF16 values for a BF16 cache, FP32 decode above for INT8-G64), then
- * evaluates score dot products, stable softmax, and value reduction in FP64. The BF16 Op output is
- * promoted to FP64 for comparison with that result.
+ * and logical cache values (BF16 values for a BF16 cache, rotated-domain FP32 decode above for
+ * INT8-G64), then evaluates score dot products, stable softmax, and value reduction in FP64. For
+ * an INT8 cache the oracle rotates BF16 Q and the logical K/V groups with the same rot and
+ * un-rotates the reduced value before comparison, so every dot product runs over
+ * rotation-equivalent operands. The BF16 Op output is promoted to FP64 for comparison with that
+ * result.
  *
  * The registered INT8 implementation defines Q8-G64, paired with INT8-G64 K, as its native query
- * compute profile. Its profile-defined query quantization and any narrower staging do not replace
- * BF16 Q in the ideal oracle. BF16-cache and INT8-cache compute profiles therefore have separate
- * named numerical criteria owned by the GQA conformance test. Those envelopes apply to the
- * registered geometries, tested token extents, conformance matrix, and target-representative
+ * compute profile: it encodes the rotated query with the same per-64-group rule and reads the
+ * rotated-domain codes. Its profile-defined query quantization and any narrower staging do not
+ * replace BF16 Q in the ideal oracle. BF16-cache and INT8-cache compute profiles therefore have
+ * separate named numerical criteria owned by the GQA conformance test. Those envelopes apply to
+ * the registered geometries, tested token extents, conformance matrix, and target-representative
  * activation range; they are not a universal error bound for arbitrary adversarial BF16 tensors.
  * A1 and A3 are each qualified directly against the ideal oracle. A1-versus-A3 parity is only an
  * additional consistency check.
