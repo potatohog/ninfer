@@ -29,6 +29,10 @@ struct TextConfig {
     static constexpr int head_dim    = 256;
     static constexpr int rotary_dim  = 64;
 
+    // INT8-G64 codec: one FP16 scale per rotated 64-group (per-64). 35B keeps the baseline
+    // scale granularity; the per-32 INT8-G64/S32 codec is a 27B-only route.
+    static constexpr int kv_scale_group = 64;
+
     static constexpr float rms_epsilon = 1.0e-6F;
     static constexpr float rope_theta  = 1.0e7F;
 

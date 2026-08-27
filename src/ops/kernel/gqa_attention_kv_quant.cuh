@@ -21,6 +21,10 @@ namespace ninfer::ops {
 inline constexpr int kGqaKvQuantHeadDim = 256;
 inline constexpr int kGqaKvQuantGroup   = 64;
 inline constexpr int kGqaKvQuantGroups  = kGqaKvQuantHeadDim / kGqaKvQuantGroup;
+// kGqaKvQuantGroups is the number of rotated 64-groups per head (fixed by the WHT width).
+// The number of FP16 *scale slots* per head is a per-target codec choice carried by
+// Geometry::KvScaleSlots: 4 for per-64 INT8-G64, 8 for per-32 INT8-G64/S32 (two 32-half
+// scales per 64-group). The code (int8) layout is unchanged; only the scale plane grows.
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_quant_code_index(int physical_page, int kv_head,
@@ -31,9 +35,9 @@ __device__ __forceinline__ std::int64_t gqa_kv_quant_code_index(int physical_pag
 
 template <typename Geometry>
 __device__ __forceinline__ std::int64_t gqa_kv_quant_scale_index(int physical_page, int kv_head,
-                                                                 int group, int page_offset) {
-    return paged_kv_element_offset<kGqaKvQuantGroups, Geometry::KVHeads>(physical_page, kv_head,
-                                                                         page_offset, group);
+                                                                 int scale_slot, int page_offset) {
+    return paged_kv_element_offset<Geometry::KvScaleSlots, Geometry::KVHeads>(
+        physical_page, kv_head, page_offset, scale_slot);
 }
 
 template <typename Geometry>

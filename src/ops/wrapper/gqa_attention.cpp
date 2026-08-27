@@ -35,6 +35,14 @@ void require_kv_heads(std::int32_t kv_heads, const char* op) {
     }
 }
 
+// Scale-plane slots per head. The 27B (4 KV heads) uses the per-32 INT8-G64/S32 codec (8 slots);
+// the 35B (2 KV heads) uses per-64 INT8-G64 (4 slots). The kernel reads Geometry::KvScaleSlots,
+// which matches the target that materialized the cache.
+std::int32_t scale_slots_for_kv_heads(std::int32_t kv_heads, const char* op) {
+    require_kv_heads(kv_heads, op);
+    return kv_heads == 4 ? kHeadDim / (kQuantGroup / 2) : kHeadDim / kQuantGroup;
+}
+
 void require_shape(const Tensor& tensor, std::int32_t n0, std::int32_t n1, std::int32_t n2,
                    std::int32_t n3, const char* op, const char* name) {
     if (tensor.ne[0] != n0 || tensor.ne[1] != n1 || tensor.ne[2] != n2 || tensor.ne[3] != n3) {
@@ -94,13 +102,13 @@ std::uint32_t validate_cache(const PagedKVLayerView& cache, std::int32_t kv_head
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const std::int32_t scale_slots = scale_slots_for_kv_heads(kv_heads, op);
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
-    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_scale_pages, scale_slots, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k scale pages");
-    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_scale_pages, scale_slots, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v scale pages");
     require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
     require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");
@@ -152,13 +160,13 @@ std::uint32_t validate_batch_cache(const PagedKVBatchLayerView& cache, std::int3
         return static_cast<std::uint32_t>(capacity);
     }
 
-    constexpr std::int32_t groups = kHeadDim / kQuantGroup;
+    const std::int32_t scale_slots = scale_slots_for_kv_heads(kv_heads, op);
     if (cache.k_scale_pages.dtype != DType::FP16 || cache.v_scale_pages.dtype != DType::FP16) {
         throw std::invalid_argument(std::string(op) + ": invalid KV cache scale dtype");
     }
-    require_shape(cache.k_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.k_scale_pages, scale_slots, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache k scale pages");
-    require_shape(cache.v_scale_pages, groups, kPagedKVPageSize, kv_heads, physical_pages, op,
+    require_shape(cache.v_scale_pages, scale_slots, kPagedKVPageSize, kv_heads, physical_pages, op,
                   "cache v scale pages");
     require_contiguous_nonnull(cache.k_scale_pages, op, "cache k scale pages");
     require_contiguous_nonnull(cache.v_scale_pages, op, "cache v scale pages");

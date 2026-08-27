@@ -35,8 +35,11 @@ inline constexpr int kGqaPrefillI8VStageBytes =
     kGqaPrefillI8Bc * kGqaPrefillHeadDim * static_cast<int>(sizeof(__half));
 inline constexpr int kGqaPrefillI8PBytes =
     kGqaPrefillI8Br * kGqaPrefillI8Bc * static_cast<int>(sizeof(__half));
+// The scale smem is sized for the per-32 INT8-G64/S32 codec (8 slots/head, 27B); the per-64
+// codec (35B) uses 4. The kernel indexes with Geometry::KvScaleSlots, so 35B leaves slack.
+inline constexpr int kGqaPrefillI8MaxScaleSlots = 8;
 inline constexpr int kGqaPrefillI8ScaleBytes =
-    2 * kGqaPrefillI8Bc * kGqaPrefillI8Groups * static_cast<int>(sizeof(__half));
+    2 * kGqaPrefillI8Bc * kGqaPrefillI8MaxScaleSlots * static_cast<int>(sizeof(__half));
 inline constexpr int kGqaPrefillI8StatsBytes =
     2 * kGqaPrefillI8Br * static_cast<int>(sizeof(float));
 inline constexpr int kGqaPrefillI8SmemBytes = kGqaPrefillI8QBytes + kGqaPrefillI8QScaleBytes +
@@ -46,7 +49,7 @@ inline constexpr int kGqaPrefillI8SmemBytes = kGqaPrefillI8QBytes + kGqaPrefillI
 
 static_assert(kGqaPrefillI8Groups == 4);
 static_assert(kGqaPrefillI8DConsumers == 4);
-static_assert(kGqaPrefillI8SmemBytes == 92672);
+static_assert(kGqaPrefillI8SmemBytes == 93696);
 
 __device__ __forceinline__ void gqa_prefill_i8_store_swz(std::int8_t* tile, int row, int d,
                                                          std::int8_t code) {
@@ -90,6 +93,7 @@ __launch_bounds__(256) __global__
                                               __half* __restrict__ scale_k,
                                               __half* __restrict__ scale_v, std::int32_t width) {
     constexpr int Warps         = 8;
+    constexpr bool PerHalf      = Geometry::KvScaleSlots > kGqaKvQuantGroups;
     constexpr unsigned FullMask = 0xffffffffu;
     const int tokens            = metadata.valid_tokens(width);
     const int warp              = static_cast<int>(threadIdx.x) >> 5;
@@ -121,30 +125,65 @@ __launch_bounds__(256) __global__
     hadamard64_warp_pair(k0, k1, lane, FullMask);
     hadamard64_warp_pair(v0, v1, lane, FullMask);
 
-    float k_abs = fmaxf(fabsf(k0), fabsf(k1));
-    float v_abs = fmaxf(fabsf(v0), fabsf(v1));
-    k_abs       = warp_max(k_abs, FullMask);
-    v_abs       = warp_max(v_abs, FullMask);
+    if constexpr (PerHalf) {
+        // INT8-G64/S32: one scale per 32-half (lane i holds local i and i+32).
+        const float kamax_lo = warp_max(fabsf(k0), FullMask);
+        const float kamax_hi = warp_max(fabsf(k1), FullMask);
+        const float vamax_lo = warp_max(fabsf(v0), FullMask);
+        const float vamax_hi = warp_max(fabsf(v1), FullMask);
+        const __half ksh_lo  = __float2half_rn(kamax_lo > 0.0f ? kamax_lo / 127.0f : 0.0f);
+        const __half ksh_hi  = __float2half_rn(kamax_hi > 0.0f ? kamax_hi / 127.0f : 0.0f);
+        const __half vsh_lo  = __float2half_rn(vamax_lo > 0.0f ? vamax_lo / 127.0f : 0.0f);
+        const __half vsh_hi  = __float2half_rn(vamax_hi > 0.0f ? vamax_hi / 127.0f : 0.0f);
+        const float kinv_lo  = __half2float(ksh_lo) > 0.0f ? 1.0f / __half2float(ksh_lo) : 0.0f;
+        const float kinv_hi  = __half2float(ksh_hi) > 0.0f ? 1.0f / __half2float(ksh_hi) : 0.0f;
+        const float vinv_lo  = __half2float(vsh_lo) > 0.0f ? 1.0f / __half2float(vsh_lo) : 0.0f;
+        const float vinv_hi  = __half2float(vsh_hi) > 0.0f ? 1.0f / __half2float(vsh_hi) : 0.0f;
+        page = __shfl_sync(FullMask, page, 0);
+        const std::int64_t code_base_lo =
+            gqa_kv_quant_code_index<Geometry>(page, kv_head, group * kGqaKvQuantGroup, page_off);
+        const std::int64_t code_base_hi = code_base_lo + 32;
+        cache_k[code_base_lo + lane] = gqa_kv_quant_code(k0, kinv_lo);
+        cache_k[code_base_hi + lane] = gqa_kv_quant_code(k1, kinv_hi);
+        cache_v[code_base_lo + lane] = gqa_kv_quant_code(v0, vinv_lo);
+        cache_v[code_base_hi + lane] = gqa_kv_quant_code(v1, vinv_hi);
+        if (lane == 0) {
+            const std::int64_t so_lo =
+                gqa_kv_quant_scale_index<Geometry>(page, kv_head, 2 * group, page_off);
+            const std::int64_t so_hi =
+                gqa_kv_quant_scale_index<Geometry>(page, kv_head, 2 * group + 1, page_off);
+            scale_k[so_lo] = ksh_lo;
+            scale_k[so_hi] = ksh_hi;
+            scale_v[so_lo] = vsh_lo;
+            scale_v[so_hi] = vsh_hi;
+        }
+    } else {
+        // INT8-G64 (baseline): one scale per 64-group.
+        float k_abs = fmaxf(fabsf(k0), fabsf(k1));
+        float v_abs = fmaxf(fabsf(v0), fabsf(v1));
+        k_abs       = warp_max(k_abs, FullMask);
+        v_abs       = warp_max(v_abs, FullMask);
 
-    const __half ksh = __float2half_rn(k_abs > 0.0f ? k_abs / 127.0f : 0.0f);
-    const __half vsh = __float2half_rn(v_abs > 0.0f ? v_abs / 127.0f : 0.0f);
-    const float ks   = __half2float(ksh);
-    const float vs   = __half2float(vsh);
-    const float kinv = ks > 0.0f ? 1.0f / ks : 0.0f;
-    const float vinv = vs > 0.0f ? 1.0f / vs : 0.0f;
-    page             = __shfl_sync(FullMask, page, 0);
+        const __half ksh = __float2half_rn(k_abs > 0.0f ? k_abs / 127.0f : 0.0f);
+        const __half vsh = __float2half_rn(v_abs > 0.0f ? v_abs / 127.0f : 0.0f);
+        const float ks   = __half2float(ksh);
+        const float vs   = __half2float(vsh);
+        const float kinv = ks > 0.0f ? 1.0f / ks : 0.0f;
+        const float vinv = vs > 0.0f ? 1.0f / vs : 0.0f;
+        page             = __shfl_sync(FullMask, page, 0);
 
-    const std::int64_t code_base =
-        gqa_kv_quant_code_index<Geometry>(page, kv_head, group * kGqaKvQuantGroup, page_off);
-    cache_k[code_base + lane]      = gqa_kv_quant_code(k0, kinv);
-    cache_k[code_base + lane + 32] = gqa_kv_quant_code(k1, kinv);
-    cache_v[code_base + lane]      = gqa_kv_quant_code(v0, vinv);
-    cache_v[code_base + lane + 32] = gqa_kv_quant_code(v1, vinv);
-    if (lane == 0) {
-        const std::int64_t scale_off =
-            gqa_kv_quant_scale_index<Geometry>(page, kv_head, group, page_off);
-        scale_k[scale_off] = ksh;
-        scale_v[scale_off] = vsh;
+        const std::int64_t code_base =
+            gqa_kv_quant_code_index<Geometry>(page, kv_head, group * kGqaKvQuantGroup, page_off);
+        cache_k[code_base + lane]      = gqa_kv_quant_code(k0, kinv);
+        cache_k[code_base + lane + 32] = gqa_kv_quant_code(k1, kinv);
+        cache_v[code_base + lane]      = gqa_kv_quant_code(v0, vinv);
+        cache_v[code_base + lane + 32] = gqa_kv_quant_code(v1, vinv);
+        if (lane == 0) {
+            const std::int64_t scale_off =
+                gqa_kv_quant_scale_index<Geometry>(page, kv_head, group, page_off);
+            scale_k[scale_off] = ksh;
+            scale_v[scale_off] = vsh;
+        }
     }
 }
 
@@ -233,6 +272,9 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
     constexpr int Bc            = kGqaPrefillI8Bc;
     constexpr int DB16          = kGqaPrefillI8DB16;
     constexpr int Groups        = kGqaPrefillI8Groups;
+    // INT8-G64/S32: scale-plane slots per head (8 for 27B per-32, 4 for 35B per-64).
+    constexpr int ScaleSlots    = Geometry::KvScaleSlots;
+    constexpr bool PerHalf      = Geometry::KvScaleSlots > kGqaKvQuantGroups;
     constexpr int GroupKc       = kGqaKvQuantGroup / 32;
     constexpr int QKNt          = Bc / 8;
     constexpr int PVNtPerWarp   = D / (kGqaPrefillI8DConsumers * 8);
@@ -257,8 +299,8 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                                                   kGqaPrefillI8VStageBytes);
     __half* k_scale_s =
         reinterpret_cast<__half*>(reinterpret_cast<unsigned char*>(p_s) + kGqaPrefillI8PBytes);
-    __half* v_scale_s    = k_scale_s + Bc * Groups;
-    float* alpha_s       = reinterpret_cast<float*>(v_scale_s + Bc * Groups);
+    __half* v_scale_s    = k_scale_s + Bc * ScaleSlots;
+    float* alpha_s       = reinterpret_cast<float*>(v_scale_s + Bc * ScaleSlots);
     float* final_l_s     = alpha_s + Br;
     __nv_bfloat16* q_b16 = reinterpret_cast<__nv_bfloat16*>(q_i8);
     __nv_bfloat16* k_b16 = reinterpret_cast<__nv_bfloat16*>(k_i8);
@@ -312,13 +354,16 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
         const int physical_page = block_table[tile_k0 >> kPagedKVPageShift];
         for (int key_l = tid; key_l < Bc; key_l += kGqaPrefillI8Threads) {
             const int key = tile_k0 + key_l;
-            __half* kd    = &k_scale_s[key_l * Groups];
-            __half* vd    = &v_scale_s[key_l * Groups];
+            __half* kd    = &k_scale_s[key_l * ScaleSlots];
+            __half* vd    = &v_scale_s[key_l * ScaleSlots];
             if (key <= max_query_abs) {
                 const std::int64_t off =
                     gqa_kv_quant_scale_index<Geometry>(physical_page, kv_head, 0, key_l);
-                ninfer::ops::cp_async<8>(kd, &cache_k_scale[off]);
-                ninfer::ops::cp_async<8>(vd, &cache_v_scale[off]);
+                ninfer::ops::cp_async<ScaleSlots * 2>(kd, &cache_k_scale[off]);
+                ninfer::ops::cp_async<ScaleSlots * 2>(vd, &cache_v_scale[off]);
+            } else if constexpr (PerHalf) {
+                store_vec(kd, make_int4(0, 0, 0, 0));
+                store_vec(vd, make_int4(0, 0, 0, 0));
             } else {
                 store_vec(kd, make_int2(0, 0));
                 store_vec(vd, make_int2(0, 0));
@@ -423,32 +468,64 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
 
 #pragma unroll
                 for (int nt = 0; nt < QKNt; ++nt) {
-                    int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
-#pragma unroll
-                    for (int kk = 0; kk < GroupKc; ++kk) {
-                        const int k    = grp * GroupKc + kk;
-                        const int brow = nt * 8 + b_rin;
-                        const int bcol = k * 16 + b_koff;
-                        unsigned bf[2];
-                        ldmatrix_x2(bf[0], bf[1],
-                                    smem_addr(&k_b16[brow * DB16 + gqa_prefill_swz(brow, bcol)]));
-                        mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
-                               bf[1]);
-                    }
                     const int keya = nt * 8 + 2 * lid;
                     const int keyb = keya + 1;
-                    float ks0      = 0.0f;
-                    float ks1      = 0.0f;
-                    if (gid == 0) {
-                        ks0 = __half2float(k_scale_s[keya * Groups + grp]);
-                        ks1 = __half2float(k_scale_s[keyb * Groups + grp]);
+                    if constexpr (PerHalf) {
+                        // INT8-G64/S32: each 32-half int8 sum (kk=0 lo, kk=1 hi) is rescaled with
+                        // its own scale (slot 2*grp+kk).
+#pragma unroll
+                        for (int kk = 0; kk < GroupKc; ++kk) {
+                            int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                            const int k    = grp * GroupKc + kk;
+                            const int brow = nt * 8 + b_rin;
+                            const int bcol = k * 16 + b_koff;
+                            unsigned bf[2];
+                            ldmatrix_x2(bf[0], bf[1],
+                                        smem_addr(&k_b16[brow * DB16 + gqa_prefill_swz(brow, bcol)]));
+                            mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
+                                   bf[1]);
+                            const int sidx = 2 * grp + kk;
+                            float ks0      = 0.0f;
+                            float ks1      = 0.0f;
+                            if (gid == 0) {
+                                ks0 = __half2float(k_scale_s[keya * ScaleSlots + sidx]);
+                                ks1 = __half2float(k_scale_s[keyb * ScaleSlots + sidx]);
+                            }
+                            ks0 = __shfl_sync(FullMask, ks0, lid);
+                            ks1 = __shfl_sync(FullMask, ks1, lid);
+                            score[nt][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
+                            score[nt][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
+                            score[nt][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
+                            score[nt][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
+                        }
+                    } else {
+                        // INT8-G64 (per-64): accumulate the int8 sum over both 32-halves, then
+                        // rescale once by scale grp. Bit-identical to the combined per-group rescale.
+                        int c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+#pragma unroll
+                        for (int kk = 0; kk < GroupKc; ++kk) {
+                            const int k    = grp * GroupKc + kk;
+                            const int brow = nt * 8 + b_rin;
+                            const int bcol = k * 16 + b_koff;
+                            unsigned bf[2];
+                            ldmatrix_x2(bf[0], bf[1],
+                                        smem_addr(&k_b16[brow * DB16 + gqa_prefill_swz(brow, bcol)]));
+                            mma_s8(c0, c1, c2, c3, af[kk][0], af[kk][1], af[kk][2], af[kk][3], bf[0],
+                                   bf[1]);
+                        }
+                        float ks0   = 0.0f;
+                        float ks1   = 0.0f;
+                        if (gid == 0) {
+                            ks0 = __half2float(k_scale_s[keya * ScaleSlots + grp]);
+                            ks1 = __half2float(k_scale_s[keyb * ScaleSlots + grp]);
+                        }
+                        ks0 = __shfl_sync(FullMask, ks0, lid);
+                        ks1 = __shfl_sync(FullMask, ks1, lid);
+                        score[nt][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
+                        score[nt][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
+                        score[nt][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
+                        score[nt][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
                     }
-                    ks0          = __shfl_sync(FullMask, ks0, lid);
-                    ks1          = __shfl_sync(FullMask, ks1, lid);
-                    score[nt][0] = __fmaf_rn(qs0 * ks0, static_cast<float>(c0), score[nt][0]);
-                    score[nt][1] = __fmaf_rn(qs0 * ks1, static_cast<float>(c1), score[nt][1]);
-                    score[nt][2] = __fmaf_rn(qs1 * ks0, static_cast<float>(c2), score[nt][2]);
-                    score[nt][3] = __fmaf_rn(qs1 * ks1, static_cast<float>(c3), score[nt][3]);
                 }
             }
 
@@ -530,10 +607,19 @@ __global__ __maxnreg__(120) void gqa_attention_prefill_i8_kernel(
                 const int key   = k0 + key_l;
                 __half* dst     = &v_f16[key_l * D + gqa_prefill_swz(key_l, d)];
                 if (key <= max_query_abs) {
-                    const int grp = d >> 6;
-                    __half vs     = __float2half_rn(0.0f);
-                    if ((lane & 7) == 0) { vs = v_scale_s[key_l * Groups + grp]; }
-                    vs = __shfl_sync(FullMask, vs, grp * 8);
+                    const int grp  = d >> 6;
+                    const int half = (d >> 5) & 1;
+                    const int sidx = PerHalf ? 2 * grp + half : grp;
+                    __half vs;
+                    if constexpr (PerHalf) {
+                        // Per-32: each 8-dim chunk has its own slot; the 8-lane group spans both
+                        // halves, so load the chunk's own slot directly (no shared shfl).
+                        vs = v_scale_s[key_l * ScaleSlots + sidx];
+                    } else {
+                        vs = __float2half_rn(0.0f);
+                        if ((lane & 7) == 0) { vs = v_scale_s[key_l * ScaleSlots + sidx]; }
+                        vs = __shfl_sync(FullMask, vs, grp * 8);
+                    }
                     store_vec(dst, gqa_prefill_i8_dequant_f16x8(&v_i8[key_l * D + d], vs));
                 } else {
                     store_vec(dst, make_int4(0, 0, 0, 0));

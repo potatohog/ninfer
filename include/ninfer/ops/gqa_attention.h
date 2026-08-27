@@ -42,6 +42,14 @@ struct GqaExecutionEnvelope {
  *   code[i]    = s == 0 ? 0 : I8(clamp(RNE_even(FP32(r[i]) * inv), -127, 127))
  *   decode[i]  = FP32(code[i]) * s        (rotated domain)
  *
+ * The scale granularity is a property of the registered target, and the scale plane's per-head
+ * extent reflects it. The INT8-G64/S32 variant (Qwen 3.6/3.8 27B) keeps one FP16 scale per
+ * contiguous 32-element half of a rotated 64-group: the group is the same WHT rot, and the first
+ * half (r[0:32]) and second half (r[32:64]) each carry their own (a, scale_bits, s, inv) with a
+ * taken over that half. Its scale plane therefore holds head_dim/32 FP16 slots per head (8 for
+ * head_dim 256) rather than head_dim/64 (4). Targets that keep one scale per 64-group use the
+ * per-64 rule above unchanged. The Q8-G64 query rule is per-64 in every registered target.
+ *
  * A1 and A2 produce identical code and scale bits. The common ideal attention oracle uses BF16 Q
  * and logical cache values (BF16 values for a BF16 cache, rotated-domain FP32 decode above for
  * INT8-G64), then evaluates score dot products, stable softmax, and value reduction in FP64. For

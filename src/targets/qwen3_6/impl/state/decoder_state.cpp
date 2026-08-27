@@ -13,16 +13,22 @@ std::uint32_t page_count(std::uint32_t capacity) {
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
                               std::int32_t kv_heads, std::int32_t head_dim, DType dtype,
-                              std::int32_t quant_group, std::int32_t table_rows,
-                              std::uint32_t physical_page_groups) {
+                              std::int32_t quant_group, std::int32_t scale_group,
+                              std::int32_t table_rows, std::uint32_t physical_page_groups) {
     if (layers == 0 ||
         layers > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max()) ||
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
     const bool quantized = dtype == DType::I8;
+    // quant_group is the WHT width (fixed 64). scale_group is the per-target scale granularity
+    // (== quant_group for per-64 INT8-G64, quant_group/2 == 32 for per-32 INT8-G64/S32); it
+    // must evenly refine the WHT group so the per-32 halves align with the rotated groups.
     if ((!quantized && (dtype != DType::BF16 || quant_group != 0)) ||
-        (quantized && (quant_group != kKvQuantGroup || head_dim % quant_group != 0))) {
+        (quantized &&
+         (quant_group != kKvQuantGroup || head_dim % quant_group != 0 || scale_group <= 0 ||
+          scale_group > quant_group || quant_group % scale_group != 0 ||
+          head_dim % scale_group != 0))) {
         throw std::invalid_argument("Paged KV cache dtype or quantization is invalid");
     }
 
@@ -30,6 +36,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     if (physical_page_groups < logical_pages) {
         throw std::invalid_argument("Paged KV physical pages are below logical capacity");
     }
+
+    // The scale plane holds head_dim/scale_group FP16 slots per head (4 for per-64, 8 for
+    // per-32). The code (int8) planes are unchanged.
+    const std::int32_t scale_extent = quantized ? head_dim / scale_group : 0;
 
     PagedKVPoolSpec pool_spec;
     pool_spec.page_group_count      = physical_page_groups;
@@ -40,8 +50,8 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
         pool_spec.planes.push_back({dtype, head_dim, kv_heads, 256});
         if (quantized) {
-            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
-            pool_spec.planes.push_back({DType::FP16, head_dim / quant_group, kv_heads, 256});
+            pool_spec.planes.push_back({DType::FP16, scale_extent, kv_heads, 256});
+            pool_spec.planes.push_back({DType::FP16, scale_extent, kv_heads, 256});
         }
     }
     return PagedKVCacheLayout{
@@ -61,11 +71,13 @@ DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderState
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                spec.kv_table_rows, spec.text_physical_page_groups);
+                                spec.kv_scale_group, spec.kv_table_rows,
+                                spec.text_physical_page_groups);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_dtype, spec.kv_quant_group,
-                                   spec.kv_table_rows, spec.mtp_physical_page_groups);
+                                   spec.kv_scale_group, spec.kv_table_rows,
+                                   spec.mtp_physical_page_groups);
     }
     layout.linear_attention = plan_linear_attention_state_pool(builder, spec.linear_attention);
     return layout;

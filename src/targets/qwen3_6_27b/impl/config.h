@@ -30,6 +30,10 @@ struct TextConfig {
     static constexpr int head_dim    = 256;
     static constexpr int rotary_dim  = 64;
 
+    // INT8-G64/S32 codec: two FP16 scales per rotated 64-group (one per 32-half). The WHT
+    // width (kv group) stays 64; this halves the scale granularity. 27B only.
+    static constexpr int kv_scale_group = 32;
+
     static constexpr int full_attention_interval = qwen3_6::kHybridAttentionInterval;
     static constexpr float rms_epsilon           = 1.0e-6F;
     static constexpr float rope_theta            = 1.0e7F;
