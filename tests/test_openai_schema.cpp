@@ -309,6 +309,26 @@ int test_tools() {
                      Json{{"role", "tool"}, {"tool_call_id", "call_1"}, {"content", "sunny"}}});
     failures += check(parse(history).generation.has_tool_history(),
                       "tool-call history follows wire types without inventing JSON validation");
+
+    Json mixed_assistant        = base_request();
+    mixed_assistant["messages"] = Json::array(
+        {Json{{"role", "user"}, {"content", "inspect"}},
+         Json{{"role", "assistant"},
+              {"content", "I will inspect it"},
+              {"tool_calls",
+               Json::array({Json{
+                   {"id", "call_2"},
+                   {"type", "function"},
+                   {"function", Json{{"name", "inspect"}, {"arguments", R"({"path":"a"})"}}}}})}}});
+    const GenerationRequest mixed_request  = parse(mixed_assistant).generation;
+    const ninfer::PromptInput mixed_prompt = prompt(mixed_request);
+    failures += check(mixed_request.messages[1].cache_boundary_after &&
+                          !mixed_request.messages[1].content[0].cache_boundary_after &&
+                          !mixed_prompt.context_cache.markers.empty() &&
+                          mixed_prompt.context_cache.markers.back().location ==
+                              ninfer::PromptCacheMarkerLocation::MessageBoundary &&
+                          mixed_prompt.context_cache.markers.back().after_message_count == 2,
+                      "automatic caching stops after a complete assistant text/tool-call turn");
     return failures;
 }
 
@@ -392,6 +412,28 @@ int test_messages_and_media() {
     body["messages"][0]["name"] = "speaker";
     failures += check(api_error([&] { (void)parse(body); }).code == "message_name_not_supported",
                       "message name rejected");
+
+    body = base_request();
+    body["messages"].push_back(Json{
+        {"role", "assistant"},
+        {"content", nullptr},
+        {"tool_calls",
+         Json::array({Json{{"id", "call_1"},
+                           {"type", "function"},
+                           {"function", Json{{"name", "get_status"}, {"arguments", "{}"}}}}})}});
+    body["messages"].push_back(Json{
+        {"role", "tool"}, {"name", "get_status"}, {"tool_call_id", "call_1"}, {"content", "ok"}});
+    const GenerationRequest named_tool_history = parse(body).generation;
+    const ChatTurn& named_tool                 = named_tool_history.messages.back();
+    failures += check(named_tool.role == ninfer::ChatRole::Tool &&
+                          named_tool.tool_call_id == "call_1" && !named_tool.tool_result_name &&
+                          named_tool.content.size() == 1 && named_tool.content[0].text == "ok",
+                      "tool message name is an ignored compatibility extension");
+
+    body["messages"].back()["name"] = Json::array();
+    failures +=
+        check(api_error([&] { (void)parse(body); }).message == "message name must be a string",
+              "tool message name remains type checked");
 
     body                           = base_request();
     body["messages"][0]["name"]    = "";

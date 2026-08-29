@@ -2,6 +2,7 @@
 
 #include "serve/anthropic_messages.h"
 #include "serve/console_log.h"
+#include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
 
@@ -208,6 +209,7 @@ HttpServer::HttpServer(ServeOptions options)
     server_.new_task_queue         = [queued_requests, worker_count] {
         return new httplib::ThreadPool(worker_count, queued_requests);
     };
+    server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
     register_routes();
 }

@@ -76,6 +76,11 @@ target_include_directories(ninfer_sampling_defaults_test PRIVATE
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_27b/export
   ${PROJECT_SOURCE_DIR}/src/targets/qwen3_6_35b_a3b/export)
+ninfer_add_test(ninfer_perplexity_evaluation_test
+  SOURCES test_perplexity_evaluation.cpp
+          ${PROJECT_SOURCE_DIR}/apps/perplexity/evaluation.cpp)
+target_include_directories(ninfer_perplexity_evaluation_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/apps/perplexity)
 ninfer_add_test(ninfer_cli_options_test
   SOURCES test_cli_options.cpp ${PROJECT_SOURCE_DIR}/apps/cli/options.cpp)
 target_include_directories(ninfer_cli_options_test PRIVATE ${PROJECT_SOURCE_DIR}/apps/cli)
@@ -130,6 +135,10 @@ ninfer_add_test(ninfer_qwen3_6_27b_prefix_real_test
   SOURCES targets/qwen3_6_27b/test_engine_prefix_real.cpp
   LIBRARIES ninfer_engine)
 set_tests_properties(ninfer_qwen3_6_27b_prefix_real_test PROPERTIES SKIP_RETURN_CODE 77)
+ninfer_add_test(ninfer_qwen3_6_27b_score_real_test
+  SOURCES targets/qwen3_6_27b/test_engine_score_real.cpp
+  LIBRARIES ninfer_engine)
+set_tests_properties(ninfer_qwen3_6_27b_score_real_test PROPERTIES SKIP_RETURN_CODE 77)
 ninfer_add_test(ninfer_qwen3_6_27b_load_plan_test
   SOURCES targets/qwen3_6_27b/test_load_plan.cpp
   NEEDS_SOURCE_DIR
@@ -188,6 +197,11 @@ ninfer_add_test(ninfer_http_error_handler_test
   LIBRARIES ninfer_serve)
 target_include_directories(ninfer_http_error_handler_test PRIVATE
   ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
+ninfer_add_test(ninfer_http_transport_test
+  SOURCES test_http_transport.cpp
+  LIBRARIES ninfer_serve)
+target_include_directories(ninfer_http_transport_test PRIVATE
+  ${PROJECT_SOURCE_DIR}/third_party/cpp-httplib)
 ninfer_add_test(ninfer_bench_support_test
   SOURCES test_ninfer_bench_support.cpp
           ${PROJECT_SOURCE_DIR}/bench/targets/qwen3_6_27b/ninfer_bench_support.cpp
@@ -227,6 +241,7 @@ set(ninfer_op_tests
   scalar
   cast
   scatter
+  target_logprobs
   position)
 foreach(op IN LISTS ninfer_op_tests)
   ninfer_add_op_test(ninfer_${op}_test

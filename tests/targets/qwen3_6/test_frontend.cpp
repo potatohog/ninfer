@@ -612,6 +612,18 @@ int test_official_chat_template() {
                           "</function>\n</tool_call><|im_end|>\n",
                       "nested or boolean tool arguments differ from official JSON rendering");
 
+    fi::ChatMessage preamble   = chat_message(ninfer::ChatRole::Assistant, "Let me check:");
+    preamble.reasoning_content = "I should inspect.";
+    preamble.tool_calls.push_back(
+        {.id = "call_read", .name = "read_file", .arguments_json = R"({"path":"a"})"});
+    failures += check(render_chat_text({chat_message(ninfer::ChatRole::User, "inspect"), preamble},
+                                       no_generation) ==
+                          "<|im_start|>user\ninspect<|im_end|>\n"
+                          "<|im_start|>assistant\n<think>\nI should inspect.\n</think>\n\n"
+                          "Let me check:\n\n<tool_call>\n<function=read_file>\n<parameter=path>\n"
+                          "a\n</parameter>\n</function>\n</tool_call><|im_end|>\n",
+                      "assistant reasoning, preamble and tool call did not share one exact turn");
+
     fi::ChatRenderOptions no_thinking;
     no_thinking.enable_thinking = false;
     failures +=
@@ -1164,12 +1176,16 @@ int test_text_and_image_prepare(const Frontend& frontend) {
         "image frontend did not own the expected patch payload and identity");
     if (!prepared_data.vision_items.empty() &&
         !prepared_data.vision_items.front().token_spans.empty()) {
-        const auto span = prepared_data.vision_items.front().token_spans.front();
-        failures += check(prepared_data.context_cache.opportunities.size() == 1 &&
-                              prepared_data.context_cache.opportunities.front().frontier >=
-                                  span.begin + span.count &&
-                              prepared_data.context_cache.opportunities.front().frontier <
-                                  prepared_data.token_ids.size(),
+        const auto span            = prepared_data.vision_items.front().token_spans.front();
+        const auto explicit_marker = std::find_if(
+            prepared_data.context_cache.opportunities.begin(),
+            prepared_data.context_cache.opportunities.end(), [](const auto& opportunity) {
+                return ninfer::has_shared_candidate_evidence(
+                    opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
+            });
+        failures += check(explicit_marker != prepared_data.context_cache.opportunities.end() &&
+                              explicit_marker->frontier >= span.begin + span.count &&
+                              explicit_marker->frontier < prepared_data.token_ids.size(),
                           "media expansion did not remap the following message cache boundary");
     }
     if (image_patches.size() == 16 * 1536) {
@@ -1387,13 +1403,18 @@ int test_explicit_leading_instruction_cache_boundary() {
         .leading_instruction_bytes = static_cast<std::uint32_t>(stable.size()),
     });
 
-    const auto prepared = frontend.prepare(std::move(input));
-    const auto& data    = FrontendFactory::inspect(prepared);
-    return check(data.context_cache.opportunities.size() == 1 &&
-                     data.context_cache.opportunities[0].kind ==
-                         ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
-                     data.context_cache.opportunities[0].frontier != 0 &&
-                     data.context_cache.opportunities[0].frontier < data.token_ids.size(),
+    const auto prepared        = frontend.prepare(std::move(input));
+    const auto& data           = FrontendFactory::inspect(prepared);
+    const auto explicit_marker = std::find_if(
+        data.context_cache.opportunities.begin(), data.context_cache.opportunities.end(),
+        [](const auto& opportunity) {
+            return ninfer::has_shared_candidate_evidence(
+                opportunity.evidence, ninfer::SharedCandidateEvidence::ExplicitBoundary);
+        });
+    return check(explicit_marker != data.context_cache.opportunities.end() &&
+                     explicit_marker->kind == ninfer::PromptCacheMarkerKind::SharedStablePrefix &&
+                     explicit_marker->frontier != 0 &&
+                     explicit_marker->frontier < data.token_ids.size(),
                  "explicit leading-system cache boundary was lost or shadowed by the automatic "
                  "full-system marker");
 }

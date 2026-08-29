@@ -90,23 +90,21 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 return true;
             }
             stream->started = true;
+            SseTransport transport(sink, stream->cancelled);
             try {
-                write_stream_item(sink, stream->cancelled, encoder->start());
+                transport.write(encoder->start());
                 StreamSink output;
                 output.on_content = [&](const std::string& text) {
-                    write_stream_item(sink, stream->cancelled, encoder->content_delta(text));
+                    transport.write(encoder->content_delta(text));
                 };
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_item(sink, stream->cancelled, encoder->reasoning_delta(text));
+                    transport.write(encoder->reasoning_delta(text));
                 };
-                output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
-                           (sink.is_writable && !sink.is_writable());
-                };
+                output.is_cancelled = [&] { return transport.poll(); };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                write_stream_items(sink, stream->cancelled, encoder->finish(outcome));
+                transport.write(encoder->finish(outcome));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
@@ -115,7 +113,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
             } catch (const ApiException& exception) {
                 log_request_error(log_context, exception.error().message);
                 try {
-                    write_stream_item(sink, stream->cancelled, sse_error_event(exception.error()));
+                    transport.write(sse_error_event(exception.error()));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -126,7 +124,7 @@ void HttpServer::handle_chat_completions(const httplib::Request& req, httplib::R
                 error.type    = "internal_error";
                 error.message = exception.what();
                 try {
-                    write_stream_item(sink, stream->cancelled, sse_error_event(error));
+                    transport.write(sse_error_event(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }

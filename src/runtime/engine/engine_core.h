@@ -1208,9 +1208,20 @@ private:
             post_capture_state == EngineRequestState::ModelFinished) {
             throw std::logic_error("committed capture offer has invalid Engine ownership");
         }
-        const bool permit_transfer = !has_pending_requests();
-        const auto reserved        = resources_.reserve_active_capture(
-            *instance_.program, *request->lane, std::move(offer), permit_transfer,
+        std::uint64_t blocked = 0;
+        {
+            std::lock_guard lock(queue_mutex_);
+            blocked = pending_.size();
+        }
+        for (const auto& active : slots_) {
+            if (active != nullptr && active != request && !active->terminal_reason) { ++blocked; }
+        }
+        const std::uint32_t blocked_runnable_requests =
+            blocked > std::numeric_limits<std::uint32_t>::max()
+                ? std::numeric_limits<std::uint32_t>::max()
+                : static_cast<std::uint32_t>(blocked);
+        const auto reserved = resources_.reserve_active_capture(
+            *instance_.program, *request->lane, std::move(offer), blocked_runnable_requests,
             CancellationFlagView{&request->cancelled});
         if (reserved == ResourceManagement::ActiveCaptureReserveResult::Skipped) { return; }
         request->capture_pending    = true;
@@ -1256,6 +1267,7 @@ private:
     }
 
     void run_prefill_step(const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
         EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
         const auto prefill_lane = scheduler_.prefill_lane();
         if (!prefill_lane) { throw std::logic_error("no request owns staged prefill"); }
@@ -1669,6 +1681,8 @@ private:
 
     void run_decode_round(const RoundMembership& membership,
                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        nvtx::ScopedRange decode_range(nvtx::Name::Decode, nvtx::Category::Decode,
+                                       static_cast<std::uint64_t>(membership.size));
         ProgramCallScope program_call(*this);
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing());
@@ -1678,6 +1692,8 @@ private:
     }
 
     void run_control_batch(const ControlMembership& membership) {
+        nvtx::ScopedRange control_range(nvtx::Name::ControlBatch, nvtx::Category::Control,
+                                        static_cast<std::uint64_t>(membership.size));
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         if (membership.empty() || membership.row_stride == 0 ||
             membership.tokens.size() !=

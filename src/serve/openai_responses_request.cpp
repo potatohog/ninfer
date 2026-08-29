@@ -3,7 +3,9 @@
 #include "serve/request_validation.h"
 
 #include <algorithm>
+#include <iterator>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -17,14 +19,6 @@ using Json = nlohmann::json;
 
 void require_object(const Json& value, std::string_view name = "request body") {
     if (!value.is_object()) { bad_request(std::string(name) + " must be a JSON object"); }
-}
-
-void require_string_hint(const Json& body, const char* key, std::size_t max_bytes = 0) {
-    if (!body.contains(key) || body.at(key).is_null()) { return; }
-    if (!body.at(key).is_string()) { bad_request(std::string(key) + " must be a string", key); }
-    if (max_bytes != 0 && body.at(key).get_ref<const std::string&>().size() > max_bytes) {
-        bad_request(std::string(key) + " exceeds its maximum length", key, "invalid_value");
-    }
 }
 
 std::string require_function_name(const Json& object, const char* param) {
@@ -103,21 +97,6 @@ std::string item_id(const Json& item, const char* prefix) {
     return item.at("id").get<std::string>();
 }
 
-bool prompt_cache_breakpoint(const Json& value) {
-    if (!value.contains("prompt_cache_breakpoint") ||
-        value.at("prompt_cache_breakpoint").is_null()) {
-        return false;
-    }
-    const Json& breakpoint = value.at("prompt_cache_breakpoint");
-    if (!breakpoint.is_object() || breakpoint.size() != 1 || !breakpoint.contains("mode") ||
-        !breakpoint.at("mode").is_string() ||
-        breakpoint.at("mode").get<std::string>() != "explicit") {
-        bad_request("prompt_cache_breakpoint must be {mode:'explicit'}", "input",
-                    "invalid_cache_breakpoint");
-    }
-    return true;
-}
-
 ninfer::product::media_acquire::Source parse_image_source(const Json& part) {
     if (part.contains("file_id") && !part.at("file_id").is_null()) {
         bad_request("input_image.file_id requires a Files API, which NInfer does not provide",
@@ -167,13 +146,9 @@ ninfer::product::media_acquire::Source parse_video_source(const Json& part) {
 }
 
 void apply_shared_breakpoint(ContentPart& part, const Json& wire, std::size_t& breakpoint_count) {
-    if (!prompt_cache_breakpoint(wire)) { return; }
+    if (!parse_openai_prompt_cache_breakpoint(wire, "input")) { return; }
     ++breakpoint_count;
-    if (breakpoint_count > 4) {
-        bad_request("at most four prompt_cache_breakpoint values are supported per request",
-                    "input", "too_many_cache_breakpoints");
-    }
-    part.cache_boundary_after = ninfer::PromptCacheMarkerKind::SharedStablePrefix;
+    part.cache_boundary_after = CacheBoundary{};
 }
 
 struct ParsedMessage {
@@ -545,6 +520,76 @@ ChatTurn parse_function_call_output_item(
     return turn;
 }
 
+enum class AssistantInputPhase {
+    Empty,
+    Reasoning,
+    Content,
+    Calls,
+};
+
+[[noreturn]] void invalid_assistant_history(std::size_t index, std::string message) {
+    bad_request("input Item " + std::to_string(index) + " " + std::move(message) +
+                    "; supported assistant Item order is reasoning, message content, then "
+                    "function calls",
+                "input", "invalid_assistant_history");
+}
+
+struct AssistantInputRun {
+    AssistantInputRun() { reset(); }
+
+    void append_reasoning(std::string reasoning, std::size_t index) {
+        switch (phase) {
+        case AssistantInputPhase::Empty:
+            turn.reasoning_content = std::move(reasoning);
+            phase                  = AssistantInputPhase::Reasoning;
+            return;
+        case AssistantInputPhase::Reasoning:
+            invalid_assistant_history(index, "reasoning cannot follow another reasoning Item");
+        case AssistantInputPhase::Content:
+            invalid_assistant_history(index, "reasoning cannot follow assistant message content");
+        case AssistantInputPhase::Calls:
+            invalid_assistant_history(index, "reasoning cannot follow function_call Items");
+        }
+        throw std::logic_error("unreachable assistant input phase");
+    }
+
+    void append_message(ChatTurn message, std::size_t index) {
+        if (message.role != ChatRole::Assistant) {
+            throw std::logic_error("assistant input run received a non-assistant message");
+        }
+        if (phase == AssistantInputPhase::Calls) {
+            invalid_assistant_history(
+                index, "assistant message content cannot follow function_call Items");
+        }
+        turn.content.insert(turn.content.end(), std::make_move_iterator(message.content.begin()),
+                            std::make_move_iterator(message.content.end()));
+        phase = AssistantInputPhase::Content;
+    }
+
+    void append_call(ToolCall call) {
+        turn.tool_calls.push_back(std::move(call));
+        phase = AssistantInputPhase::Calls;
+    }
+
+    void flush(std::vector<ChatTurn>& turns) {
+        if (phase == AssistantInputPhase::Empty) { return; }
+        if (!turn.reasoning_content.empty() || !turn.content.empty() || !turn.tool_calls.empty()) {
+            turns.push_back(std::move(turn));
+        }
+        reset();
+    }
+
+private:
+    void reset() {
+        turn      = ChatTurn{};
+        turn.role = ChatRole::Assistant;
+        phase     = AssistantInputPhase::Empty;
+    }
+
+    ChatTurn turn;
+    AssistantInputPhase phase = AssistantInputPhase::Empty;
+};
+
 void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
                  std::unordered_map<std::string, OpenAIResponsesFunctionIdentity>& identities) {
     Json values;
@@ -556,10 +601,8 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
         bad_request("input must be a string or an array of Items", "input");
     }
 
-    std::string pending_reasoning;
-    bool pending_reasoning_present = false;
-    bool can_group_function_calls  = false;
-    std::size_t breakpoint_count   = 0;
+    AssistantInputRun assistant;
+    std::size_t breakpoint_count = 0;
     std::unordered_set<std::string> item_ids;
     for (std::size_t index = 0; index < values.size(); ++index) {
         const Json& item = values.at(index);
@@ -581,50 +624,22 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
         Json canonical;
         if (type == "message") {
             ParsedMessage message = parse_message_item(item, index, breakpoint_count);
-            if (pending_reasoning_present) {
-                if (message.turn.role != ChatRole::Assistant) {
-                    bad_request("a reasoning Item must be followed by an assistant output Item",
-                                "input");
-                }
-                message.turn.reasoning_content = std::move(pending_reasoning);
-                pending_reasoning.clear();
-                pending_reasoning_present = false;
-            }
-            out.input_turns.push_back(std::move(message.turn));
-            canonical                = std::move(message.canonical);
-            can_group_function_calls = false;
-        } else if (type == "reasoning") {
-            if (pending_reasoning_present) {
-                bad_request("adjacent reasoning Items are not supported", "input");
-            }
-            pending_reasoning         = parse_reasoning_item(item, canonical);
-            pending_reasoning_present = true;
-            can_group_function_calls  = false;
-        } else if (type == "function_call") {
-            ToolCall call = parse_function_call_item(item, canonical, identities);
-            if (can_group_function_calls && !pending_reasoning_present &&
-                !out.input_turns.empty() && out.input_turns.back().role == ChatRole::Assistant &&
-                out.input_turns.back().content.empty() &&
-                !out.input_turns.back().tool_calls.empty()) {
-                out.input_turns.back().tool_calls.push_back(std::move(call));
+            canonical             = std::move(message.canonical);
+            if (message.turn.role == ChatRole::Assistant) {
+                assistant.append_message(std::move(message.turn), index);
             } else {
-                ChatTurn turn;
-                turn.role              = ChatRole::Assistant;
-                turn.reasoning_content = std::move(pending_reasoning);
-                pending_reasoning.clear();
-                pending_reasoning_present = false;
-                turn.tool_calls.push_back(std::move(call));
-                out.input_turns.push_back(std::move(turn));
+                assistant.flush(out.input_turns);
+                out.input_turns.push_back(std::move(message.turn));
             }
-            can_group_function_calls = true;
+        } else if (type == "reasoning") {
+            assistant.append_reasoning(parse_reasoning_item(item, canonical), index);
+        } else if (type == "function_call") {
+            assistant.append_call(parse_function_call_item(item, canonical, identities));
         } else if (type == "function_call_output") {
-            if (pending_reasoning_present) {
-                bad_request("a reasoning Item must be followed by an assistant output Item",
-                            "input");
-            }
-            out.input_turns.push_back(
-                parse_function_call_output_item(item, canonical, breakpoint_count, identities));
-            can_group_function_calls = false;
+            ChatTurn result =
+                parse_function_call_output_item(item, canonical, breakpoint_count, identities);
+            assistant.flush(out.input_turns);
+            out.input_turns.push_back(std::move(result));
         } else if (type == "input_file") {
             bad_request("input_file requires a Files API, which NInfer does not provide", "input",
                         "file_inputs_not_supported");
@@ -636,9 +651,7 @@ void parse_input(const Json& input, OpenAIResponsesPromptRequest& out,
         if (!item_ids.insert(id).second) { bad_request("duplicate input Item id: " + id, "input"); }
         out.input_items.push_back(std::move(canonical));
     }
-    if (pending_reasoning_present) {
-        bad_request("a reasoning Item must be followed by an assistant output Item", "input");
-    }
+    assistant.flush(out.input_turns);
 }
 
 struct ParsedPromptFields {
@@ -1061,46 +1074,6 @@ void validate_metadata(const Json& body, Json& metadata) {
     metadata = body.at("metadata");
 }
 
-void parse_prompt_cache_hints(const Json& body) {
-    require_string_hint(body, "prompt_cache_key");
-    require_string_hint(body, "safety_identifier", 64);
-    require_string_hint(body, "user");
-
-    if (body.contains("prompt_cache_retention") && !body.at("prompt_cache_retention").is_null()) {
-        if (!body.at("prompt_cache_retention").is_string()) {
-            bad_request("prompt_cache_retention must be a string", "prompt_cache_retention");
-        }
-        const std::string value = body.at("prompt_cache_retention").get<std::string>();
-        if (value != "in_memory" && value != "24h") {
-            bad_request("prompt_cache_retention must be 'in_memory' or '24h'",
-                        "prompt_cache_retention");
-        }
-    }
-    if (!body.contains("prompt_cache_options") || body.at("prompt_cache_options").is_null()) {
-        return;
-    }
-    const Json& options = body.at("prompt_cache_options");
-    if (!options.is_object()) {
-        bad_request("prompt_cache_options must be an object", "prompt_cache_options");
-    }
-    static const std::unordered_set<std::string> allowed = {"mode", "ttl"};
-    reject_nonnull_unknown_members(options, allowed, "prompt_cache_options");
-    if (options.contains("mode") && !options.at("mode").is_null()) {
-        if (!options.at("mode").is_string()) {
-            bad_request("prompt_cache_options.mode must be a string", "prompt_cache_options");
-        }
-        const std::string mode = options.at("mode").get<std::string>();
-        if (mode != "implicit" && mode != "explicit") {
-            bad_request("prompt_cache_options.mode must be 'implicit' or 'explicit'",
-                        "prompt_cache_options");
-        }
-    }
-    if (options.contains("ttl") && !options.at("ttl").is_null() &&
-        (!options.at("ttl").is_string() || options.at("ttl").get<std::string>() != "30m")) {
-        bad_request("prompt_cache_options.ttl must be '30m'", "prompt_cache_options");
-    }
-}
-
 void reject_unsupported_platform_fields(const Json& body) {
     const struct {
         const char* field;
@@ -1189,9 +1162,10 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     require_object(body);
     validate_common_top_level(body, true);
     reject_unsupported_platform_fields(body);
-    parse_prompt_cache_hints(body);
+    const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
     ParsedPromptFields parsed = parse_prompt_fields(body, limits);
+    apply_openai_prompt_cache_policy(parsed.prompt.generation, cache_policy);
     OpenAIResponsesCreateRequest out;
     out.prompt              = std::move(parsed.prompt);
     out.tools               = std::move(parsed.wire_tools);

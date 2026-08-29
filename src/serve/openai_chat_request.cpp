@@ -1,4 +1,5 @@
 #include "serve/openai_chat.h"
+#include "serve/openai_common.h"
 #include "serve/request_validation.h"
 
 #include <algorithm>
@@ -352,6 +353,9 @@ void parse_content_parts(const Json& content, ChatTurn& turn, std::size_t index)
             bad_request("content type '" + type + "' is not supported", "messages",
                         "modality_not_supported");
         }
+        if (parse_openai_prompt_cache_breakpoint(part, "messages")) {
+            parsed.cache_boundary_after = CacheBoundary{};
+        }
         turn.content.push_back(std::move(parsed));
     }
 }
@@ -430,11 +434,14 @@ std::optional<std::string> parse_assistant_reasoning(const Json& message, std::s
     return reasoning ? reasoning : content;
 }
 
-void validate_message_name(const Json& item, bool legacy_function) {
+void validate_message_name(const Json& item, ChatRole role) {
     if (!item.contains("name") || item.at("name").is_null()) { return; }
     if (!item.at("name").is_string()) { bad_request("message name must be a string", "messages"); }
-    const std::string name = item.at("name").get<std::string>();
-    if (!name.empty() && !legacy_function) {
+    const std::string& name = item.at("name").get_ref<const std::string&>();
+    // Some OpenAI-compatible clients mirror the function name onto role=tool messages. Accept
+    // that non-standard field as an ignored compatibility hint; it never reaches the Engine or
+    // prompt renderer.
+    if (!name.empty() && role != ChatRole::Tool) {
         bad_request("a non-empty message name changes participant identity, which NInfer's chat "
                     "template cannot represent",
                     "messages", "message_name_not_supported");
@@ -557,7 +564,7 @@ ChatTurn parse_message(const Json& item, std::size_t index) {
     const bool legacy_function  = role_name == "function";
     const ChatRole role         = legacy_function ? ChatRole::Tool : parse_message_role(role_name);
 
-    validate_message_name(item, legacy_function);
+    validate_message_name(item, role);
     if (legacy_function) { (void)require_function_name(item, "messages"); }
     validate_non_assistant_fields(item, role);
 
@@ -885,6 +892,8 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     }
     output.model = body.at("model").get<std::string>();
 
+    const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
+
     parse_tools(body, output.generation);
     parse_tool_choice(body, output.generation);
     parse_parallel_tool_calls(body, output.generation);
@@ -897,6 +906,7 @@ OpenAIChatRequest parse_chat_completion_request(const Json& body, const RequestL
     const TemplateOptions template_options = parse_template_options(body);
     output.generation.enable_thinking      = template_options.enable_thinking;
     output.generation.preserve_thinking    = template_options.preserve_thinking;
+    apply_openai_prompt_cache_policy(output.generation, cache_policy);
     return output;
 }
 

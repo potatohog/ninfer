@@ -20,7 +20,7 @@ benchmark-report, and external protocol behavior. Repository verification princi
   alignment, Vision control, and family runtime mechanisms;
 - `targets/qwen3_6_27b/` — registered inventory, converter recipe, source verifier, artifact
   bindings, reference diagnostics, family Program/multimodal/MTP behavior, and the opt-in real-Engine
-  prefix test;
+  prefix test and causal-scoring State/KV isolation test;
 - `targets/qwen3_6_35b_a3b/` — registered inventory/converter contracts, artifact-native diagnostic
   reference, MoE oracle, typed binding, selected-expert row access, 256K INT8 memory calculation,
   and the opt-in real public-Engine route;
@@ -113,6 +113,14 @@ runs the real engine:
 ```bash
 NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_6_27b.ninfer \
   ctest --test-dir build -R ninfer_qwen3_6_27b_prefix_real_test --output-on-failure
+```
+
+The causal-scoring integration test uses the same artifact variable and checks a full 1,024-column
+score tile, overlapping target suffixes, and repeated-window State/KV isolation:
+
+```bash
+NINFER_QWEN3_6_27B_WEIGHTS=$PWD/out/qwen3_8_27b_nvfp4.ninfer \
+  ctest --test-dir build -R ninfer_qwen3_6_27b_score_real_test --output-on-failure
 ```
 
 Run the peer 35B-A3B route independently:

@@ -186,20 +186,6 @@ ninfer::OwnedMedia acquire_media(const ContentPart& part, Clock::time_point dead
     return media;
 }
 
-void trim_cache_markers(std::vector<ninfer::PromptCacheMarker>& markers, std::uint32_t maximum) {
-    std::vector<ninfer::PromptCacheMarker> unique;
-    unique.reserve(markers.size());
-    for (const ninfer::PromptCacheMarker& marker : markers) {
-        if (std::find(unique.begin(), unique.end(), marker) == unique.end()) {
-            unique.push_back(marker);
-        }
-    }
-    if (unique.size() > maximum) {
-        unique.erase(unique.begin(), unique.end() - static_cast<std::ptrdiff_t>(maximum));
-    }
-    markers = std::move(unique);
-}
-
 [[noreturn]] void throw_request_error(const ninfer::RequestError& exception) {
     throw ApiException(request_error_to_api_error(exception));
 }
@@ -330,12 +316,15 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& request
                                      remaining_media_bytes);
             });
         std::vector<PromptCacheMarker> protocol_markers = std::move(input.context_cache.markers);
-        input.context_cache                             = std::move(context_cache);
+        const bool protocol_allows_engine_automatic =
+            input.context_cache.allow_engine_automatic_shared_prefixes;
+        input.context_cache = std::move(context_cache);
         input.context_cache.markers.insert(input.context_cache.markers.end(),
                                            std::make_move_iterator(protocol_markers.begin()),
                                            std::make_move_iterator(protocol_markers.end()));
-        trim_cache_markers(input.context_cache.markers,
-                           engine_->options().context_cache.max_cache_markers_per_request.value());
+        input.context_cache.allow_engine_automatic_shared_prefixes =
+            input.context_cache.allow_engine_automatic_shared_prefixes &&
+            protocol_allows_engine_automatic;
         prepared.acquisition_seconds =
             std::chrono::duration<double>(Clock::now() - acquisition_started).count();
         check_preparation_control(prepared.lifetime->deadline, is_cancelled);

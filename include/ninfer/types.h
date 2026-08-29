@@ -32,6 +32,11 @@ enum class KvCacheStorage : std::uint8_t {
     Fp8E4M3Row256,
 };
 
+enum class EnginePurpose : std::uint8_t {
+    Generation,
+    CausalScoring,
+};
+
 enum class KvCapacityMode : std::uint8_t {
     Explicit,
     Automatic,
@@ -78,8 +83,8 @@ struct LoadProgress {
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=C, L=2 and M=4; Engine::options() returns
-    // those effective values.
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=C and L=2; Engine::options() returns those
+    // effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
@@ -90,8 +95,6 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
-    // Input-complexity bound; this does not reserve checkpoint storage.
-    std::optional<std::uint32_t> max_cache_markers_per_request;
 };
 
 struct ContextCostOptions {
@@ -103,8 +106,9 @@ struct ContextCostOptions {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
-    std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
@@ -336,6 +340,32 @@ enum class PromptCacheMarkerKind : std::uint8_t {
     PrivateLongAnchor,
 };
 
+enum class SharedCandidateEvidence : std::uint8_t {
+    None               = 0,
+    ExplicitBoundary   = 1U << 0U,
+    RequestedAutomatic = 1U << 1U,
+    DefaultAutomatic   = 1U << 2U,
+    EngineStructural   = 1U << 3U,
+    EngineObserved     = 1U << 4U,
+};
+
+[[nodiscard]] constexpr SharedCandidateEvidence operator|(SharedCandidateEvidence left,
+                                                          SharedCandidateEvidence right) noexcept {
+    return static_cast<SharedCandidateEvidence>(static_cast<std::uint8_t>(left) |
+                                                static_cast<std::uint8_t>(right));
+}
+
+constexpr SharedCandidateEvidence& operator|=(SharedCandidateEvidence& left,
+                                              SharedCandidateEvidence right) noexcept {
+    left = left | right;
+    return left;
+}
+
+[[nodiscard]] constexpr bool has_shared_candidate_evidence(SharedCandidateEvidence value,
+                                                           SharedCandidateEvidence evidence) {
+    return (static_cast<std::uint8_t>(value) & static_cast<std::uint8_t>(evidence)) != 0;
+}
+
 enum class PromptCacheMarkerLocation : std::uint8_t {
     MessageBoundary,
     MessagePartBoundary,
@@ -346,6 +376,7 @@ enum class PromptCacheMarkerLocation : std::uint8_t {
 struct PromptCacheMarker {
     std::uint32_t after_message_count  = 0;
     PromptCacheMarkerKind kind         = PromptCacheMarkerKind::SharedStablePrefix;
+    SharedCandidateEvidence evidence   = SharedCandidateEvidence::ExplicitBoundary;
     PromptCacheMarkerLocation location = PromptCacheMarkerLocation::MessageBoundary;
     // Byte count within the untrimmed leading System/Developer message.
     std::uint32_t leading_instruction_bytes = 0;
@@ -362,6 +393,9 @@ struct ContextCacheHints {
     std::optional<std::string> session_key;
     CacheRetentionHint retention = CacheRetentionHint::Default;
     std::vector<PromptCacheMarker> markers;
+    // Protocols with their own automatic/explicit write policy disable the Engine's structural
+    // candidates. Exact reads from already-published shared prefixes remain enabled.
+    bool allow_engine_automatic_shared_prefixes = true;
     // Advance the named session lineage when session_key is present. This does not require an
     // anonymous content-matched source to be retained.
     bool update_session_index = true;

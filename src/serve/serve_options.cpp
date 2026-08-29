@@ -73,7 +73,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--media-preprocess-threads N] "
            "[--device-state-slots N] [--host-state-slots N] [--host-kv-mib N] "
            "[--max-private-continuations N] [--max-shared-prefixes N] "
-           "[--max-long-anchors-per-continuation N] [--max-cache-markers-per-request N] "
+           "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
            "[--kv-dtype bf16|int8|fp8] [--kv-tail-tokens N] [--spec mtp|dflash --draft-tokens N] "
@@ -103,7 +103,7 @@ std::string serve_usage_text(const char* argv0) {
            "       exact BF16 ring read through by decode attention; 0 disables the tail\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
-           "shared=concurrency, anchors=2, markers=4; Host state=8 slots, Host KV=8192 MiB\n"
+           "shared=concurrency, anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
            "       --device-state-slots is extra checkpoint capacity beyond active lanes; "
            "--host-kv-mib uses MiB\n"
            "       --default-thinking-budget caps model-origin thinking for enabled requests; "
@@ -236,11 +236,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.context_cache.max_long_anchors_per_continuation = static_cast<std::uint32_t>(
                 parse_nonnegative_int(require_value("--max-long-anchors-per-continuation"),
                                       "max-long-anchors-per-continuation"));
-            context_capacity_explicit = true;
-        } else if (arg == "--max-cache-markers-per-request") {
-            options.context_cache.max_cache_markers_per_request = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
-                                      "max-cache-markers-per-request"));
             context_capacity_explicit = true;
         } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");

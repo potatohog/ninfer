@@ -169,18 +169,17 @@ int main() {
                           configured.media_preprocess_threads == 6,
                       "media preparation limits did not reach serving options");
 
-    const ServeOptions context_cache = parse(
-        {"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots", "5",
-         "--host-kv-mib", "64", "--max-private-continuations", "9", "--max-shared-prefixes", "4",
-         "--max-long-anchors-per-continuation", "2", "--max-cache-markers-per-request", "6"});
+    const ServeOptions context_cache =
+        parse({"ninfer-serve", "model.ninfer", "--device-state-slots", "3", "--host-state-slots",
+               "5", "--host-kv-mib", "64", "--max-private-continuations", "9",
+               "--max-shared-prefixes", "4", "--max-long-anchors-per-continuation", "2"});
     failures += check(context_cache.context_cache.enabled &&
                           context_cache.context_cache.device_state_slots == 3 &&
                           context_cache.context_cache.host_state_slots == 5 &&
                           context_cache.context_cache.host_kv_capacity_bytes == (64ULL << 20) &&
                           context_cache.context_cache.max_private_continuations == 9 &&
                           context_cache.context_cache.max_shared_prefixes == 4 &&
-                          context_cache.context_cache.max_long_anchors_per_continuation == 2 &&
-                          context_cache.context_cache.max_cache_markers_per_request == 6,
+                          context_cache.context_cache.max_long_anchors_per_continuation == 2,
                       "context-cache capacities did not reach serving options");
     bool disabled_cache_capacity_rejected = false;
     try {

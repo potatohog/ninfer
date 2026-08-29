@@ -27,7 +27,7 @@ newer, a C++20 host compiler, Ninja, `pkg-config`, FFmpeg development libraries
 (`libavformat >= 60`, `libavcodec >= 60`, `libavutil >= 58`, and `libswscale >= 7`), and
 `libcurl >= 7.85`. The build rejects CUDA architectures other than `sm_120a`.
 
-Build the two product binaries:
+Build the product binaries:
 
 ```bash
 git clone https://github.com/Neroued/ninfer.git
@@ -160,6 +160,20 @@ limit. Text evaluation used 262,144 tokens except Qwen3.8-27B NVFP4, which used 
 fit the RTX 5090 after weights. Each score is one sample per problem; model cards contain the
 correct/total counts and evaluation notes.
 
+### Perplexity
+
+Run the fixed four-domain quick corpus through the artifact's tokenizer and Text model:
+
+```bash
+./build/apps/ninfer-perplexity models/qwen3_8_27b_nvfp4.ninfer \
+  --corpus eval/corpora/perplexity-1m/manifest.json \
+  --quick --kv-dtype fp8
+```
+
+The evaluator reports token-weighted fixed-window causal perplexity and writes a complete JSON
+record under `profiles/perplexity/`. See [Perplexity evaluation](docs/perplexity.md) for the metric,
+corpus, custom-text mode, and comparison rules.
+
 ## Artifact and startup notes
 
 Current builds accept only version-2 `.ninfer` containers. All five published downloads are version
@@ -214,6 +228,7 @@ All registered model IDs support:
 - chunked prefill, exact-batch CUDA Graph decode, and startup-bounded batched decode;
 - MTP speculative decoding with draft windows from one to five;
 - BF16, INT8 group-64, and row-scaled FP8 E4M3 KV storage;
+- offline causal-perplexity scoring with the same Text model and selectable KV storage;
 - private and shared exact-prefix reuse with Device/Host State and KV retention;
 - model-aware sampling defaults and explicit sampler overrides;
 - OpenAI Responses Core, OpenAI Chat Completions, and Anthropic Messages, including streaming,
@@ -243,13 +258,13 @@ capacities remain fixed for the process lifetime.
 - [CLI](docs/cli.md)
 - [HTTP serving](docs/serving.md)
 - [Performance](docs/performance.md)
+- [Perplexity evaluation](docs/perplexity.md)
 - [Resource scheduling and context cache](docs/maintainer/resource-scheduling-and-context-cache.md)
 - [Serve TTFT benchmark](tools/bench/ttft/)
 - [CLI examples](examples/cli/)
 - [Contributing](CONTRIBUTING.md)
 
-Run `./build/apps/ninfer --help` or `./build/apps/ninfer-serve --help` for the exact current option
-contract.
+Run the relevant `--help` for the exact current option contract.
 
 ## License
 

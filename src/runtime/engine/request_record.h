@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/types.h"
 #include "runtime/engine/admission_policy.h"
@@ -113,7 +114,8 @@ struct RequestRecord {
                   double frontend_seconds, ResolvedRequestOptions request_options,
                   OutputConsumerMode output_consumer, Clock::time_point limit,
                   Clock::time_point submit_time)
-        : id(request_identity), publication_order(publication_sequence), prompt(std::move(input)),
+        : generation_range(nvtx::Name::Generate, nvtx::Category::Runtime, request_identity),
+          id(request_identity), publication_order(publication_sequence), prompt(std::move(input)),
           output(std::move(output_session)), prompt_summary(std::move(summary)),
           prepare_seconds(frontend_seconds), options(std::move(request_options)),
           consumer_mode(output_consumer), deadline(limit), submitted(submit_time) {}
@@ -145,6 +147,8 @@ struct RequestRecord {
         return model_state == EngineRequestState::ModelFinished;
     }
 
+    // The process range follows Request ownership across submit, worker, and consumer threads.
+    nvtx::ScopedAsyncRange generation_range;
     const std::uint64_t id;
     const std::uint64_t publication_order;
     PreparedPrompt prompt;

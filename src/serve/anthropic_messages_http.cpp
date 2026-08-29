@@ -123,26 +123,24 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 return true;
             }
             stream->started = true;
+            SseTransport transport(sink, stream->cancelled);
 
             try {
                 StreamSink output;
                 output.on_start = [&](const ninfer::GenerationStart& start) {
-                    write_stream_item(sink, stream->cancelled, encoder->start(start));
+                    transport.write(encoder->start(start));
                 };
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_items(sink, stream->cancelled, encoder->reasoning_delta(text));
+                    transport.write(encoder->reasoning_delta(text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, stream->cancelled, encoder->content_delta(text));
+                    transport.write(encoder->content_delta(text));
                 };
-                output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
-                           (sink.is_writable && !sink.is_writable());
-                };
+                output.is_cancelled = [&] { return transport.poll(); };
 
                 const GenerationOutcome outcome = service_->run(stream->prepared, &output);
                 log_request_done(log_context, outcome);
-                write_stream_items(sink, stream->cancelled, encoder->finish(outcome));
+                transport.write(encoder->finish(outcome));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
@@ -152,10 +150,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 const ApiError error = normalize_anthropic_error(exception.error());
                 log_request_error(log_context, error.message);
                 try {
-                    if (!encoder->started()) {
-                        write_stream_item(sink, stream->cancelled, encoder->start());
-                    }
-                    write_stream_item(sink, stream->cancelled, encoder->error(error));
+                    if (!encoder->started()) { transport.write(encoder->start()); }
+                    transport.write(encoder->error(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -165,10 +161,8 @@ void HttpServer::handle_messages(const httplib::Request& req, httplib::Response&
                 error.status  = 500;
                 error.message = exception.what();
                 try {
-                    if (!encoder->started()) {
-                        write_stream_item(sink, stream->cancelled, encoder->start());
-                    }
-                    write_stream_item(sink, stream->cancelled, encoder->error(error));
+                    if (!encoder->started()) { transport.write(encoder->start()); }
+                    transport.write(encoder->error(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }

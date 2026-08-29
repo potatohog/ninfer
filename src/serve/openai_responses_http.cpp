@@ -338,21 +338,17 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 return true;
             }
             stream->started = true;
+            SseTransport transport(sink, stream->cancelled);
             try {
-                write_stream_items(sink, stream->cancelled, stream->encoder->start());
+                transport.write(stream->encoder->start());
                 StreamSink output;
                 output.on_reasoning = [&](const std::string& text) {
-                    write_stream_items(sink, stream->cancelled,
-                                       stream->encoder->reasoning_delta(text));
+                    transport.write(stream->encoder->reasoning_delta(text));
                 };
                 output.on_content = [&](const std::string& text) {
-                    write_stream_items(sink, stream->cancelled,
-                                       stream->encoder->content_delta(text));
+                    transport.write(stream->encoder->content_delta(text));
                 };
-                output.is_cancelled = [&] {
-                    return stream->cancelled.load(std::memory_order_acquire) ||
-                           (sink.is_writable && !sink.is_writable());
-                };
+                output.is_cancelled = [&] { return transport.poll(); };
 
                 const GenerationOutcome outcome      = service_->run(stream->prepared, &output);
                 OpenAIResponsesStreamFinish finished = stream->encoder->finish(outcome);
@@ -360,10 +356,9 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                                        finished.response.body,
                                        std::move(finished.response.output_history),
                                        stream->prepared.preserve_thinking);
-                write_stream_items(sink, stream->cancelled, finished.events_before_terminal);
+                transport.write(finished.events_before_terminal);
                 log_request_done(stream->log_context, outcome);
-                write_stream_item(sink, stream->cancelled,
-                                  stream->encoder->terminal(finished.response));
+                transport.write(stream->encoder->terminal(finished.response));
                 sink.done();
                 return true;
             } catch (const ClientDisconnected& exception) {
@@ -373,7 +368,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = responses_error(exception.error());
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, stream->cancelled, stream->encoder->failed(error));
+                    transport.write(stream->encoder->failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }
@@ -381,7 +376,7 @@ void HttpServer::handle_responses(const httplib::Request& req, httplib::Response
                 const ApiError error = internal_error(exception);
                 log_request_error(stream->log_context, error.message);
                 try {
-                    write_stream_item(sink, stream->cancelled, stream->encoder->failed(error));
+                    transport.write(stream->encoder->failed(error));
                     sink.done();
                     return true;
                 } catch (const ClientDisconnected&) { return false; }

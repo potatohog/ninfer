@@ -78,7 +78,6 @@ int main() {
     engine_options.context_cache.max_private_continuations         = 4;
     engine_options.context_cache.max_shared_prefixes               = 2;
     engine_options.context_cache.max_long_anchors_per_continuation = 2;
-    engine_options.context_cache.max_cache_markers_per_request     = 4;
 
     const ninfer::ModelSamplingDefaults sampling_defaults{
         .thinking     = {.temperature = 1.0F, .top_k = 20, .top_p = 0.95F},
