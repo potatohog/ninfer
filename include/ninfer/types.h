@@ -111,6 +111,11 @@ struct EngineOptions {
     std::uint32_t pending_timeout_ms   = 30000;
     std::uint32_t prefill_chunk        = 1024;
     KvCacheStorage kv_cache            = KvCacheStorage::BFloat16;
+    // KV precision tail: the newest kv_tail_tokens rows (rounded to the next multiple of 64)
+    // of every full-attention layer are mirrored into a per-table-row exact BF16 ring that
+    // decode attention reads through in addition to the body cache. 0 disables the tail and
+    // keeps the single-source attention exactly.
+    std::uint32_t kv_tail_tokens = 0;
     SpeculativeOptions speculative;
     std::size_t media_cache_bytes = kDefaultMediaCacheBytes;
     std::size_t media_live_bytes  = kDefaultMediaLiveBytes;

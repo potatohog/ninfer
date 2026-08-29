@@ -73,6 +73,7 @@ struct SequencePlanningInputs {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
+    std::uint32_t kv_tail_tokens           = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;
@@ -96,6 +97,7 @@ struct SequencePlanImpl<NINFER_QWEN36_VARIANT> {
     SpeculativeBackend speculative_backend = SpeculativeBackend::None;
     DType kv_dtype                         = DType::BF16;
     std::int32_t kv_quant_group            = 0;
+    std::uint32_t kv_tail_tokens           = 0;
     ProposalHead proposal_head             = ProposalHead::Full;
     StartupFeatures features;
     bool use_cuda_graph = true;

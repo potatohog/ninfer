@@ -26,6 +26,42 @@ struct ContextAttentionExecutionEnvelope {
 };
 
 /**
+ * KV precision-tail descriptor for the D256 causal Ops.
+ *
+ * The paged body cache keeps its exact contract (every committed row is materialized in the
+ * declared body dtype as soon as it is appended). The tail is a strict BF16 overlay: a
+ * per-table-row ring of the newest rows in original (unrotated) BF16 coordinates. Let C be
+ * (tail_rows + 64) and R = C / 64 the ring rows and pages per table row. Row p of the ring of
+ * table row t occupies physical page t * R + (p / 64) % R at page offset p % 64, so the ring
+ * always holds rows [window - C, window) of the row's own absolute position sequence.
+ *
+ * watermark is a contiguous device I32 [table_rows] pointer (mutable; the Op owns the in-place
+ * update) and is the ring-validity watermark per table row: a ring row r is valid only when
+ * r >= watermark[t]; restored histories advance it to the restored length. The Op refreshes it
+ * in place with max(watermark[t], window - C) as part of the append; callers that restore body
+ * history must advance it before the next Op call.
+ *
+ * For live column j < Vb at absolute position p = positions[j,b] with window = p + 1, let
+ * base = max(0, (window - tail_rows) rounded down to a multiple of 64) and body_end =
+ * min(p, max(base, watermark[t], window - C)) for table row t = kv_table_rows[b]. The query head
+ * h attends the body rows [0, body_end] through the declared body cache profile and the tail rows
+ * [body_end + 1, p] through the ring (exact BF16, no codec); the current columns [positions[0,b],
+ * p] are read from the append input and mirrored into the ring by the same Op call. The shared oracle above applies
+ * with each key read through its own storage boundary; the split between the two sources never
+ * changes the admitted key set or the ideal result.
+ *
+ * k_ring/v_ring are contiguous BF16 [256, 64, Hkv, table_rows * R] and watermark is I32
+ * [table_rows] when tail_rows > 0. tail_rows must be a positive multiple of 64; every other
+ * descriptor field is ignored when tail_rows == 0, which restores the single-source Op exactly.
+ */
+struct CausalTailDescriptor {
+    Tensor k_ring;
+    Tensor v_ring;
+    std::int32_t* watermark = nullptr; // mutated in place by the Op (ring-validity watermark)
+    std::int32_t tail_rows  = 0;
+};
+
+/**
  * Shared numerical contract.
  *
  * Every entry computes stable scaled dot-product Softmax Attention. Query head h reads KV head
@@ -127,11 +163,19 @@ void packed_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
  * state. Inputs, output, every cache plane/table, and live workspace suballocations are pairwise
  * non-overlapping. The Op overwrites every addressed cache row but owns no cache allocation,
  * frontier, request identity, or commit authority.
+ *
+ * When tail.tail_rows > 0 the Op additionally writes the current k/v rows into the ring (the
+ * fused small-T routes mirror them inside the attention kernel; the prompt route mirrors them
+ * with a dedicated pass between the body append and the body attention) and reads the tail rows
+ * [body_end + 1, p] of CausalTailDescriptor through the ring instead of the body. The body is
+ * written exactly as in the single-source Op, so every body byte is identical with or without
+ * the tail; only the attention key source of the newest rows differs. watermark is the only
+ * descriptor storage the Op mutates (monotone max refresh).
  */
 void causal_softmax_attention(const Tensor& q, const Tensor& k, const Tensor& v,
                               const Tensor& positions, const Tensor& valid_columns,
                               const Tensor& kv_table_rows, AttentionHeadGeometry geometry,
-                              float scale, PagedKVBatchLayerView cache,
+                              float scale, PagedKVBatchLayerView cache, CausalTailDescriptor tail,
                               CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                               Tensor& out, cudaStream_t stream);
 
@@ -152,11 +196,12 @@ void causal_softmax_attention_cached(const Tensor& q, const Tensor& positions,
 /**
  * Return transient capacity for every W in the inclusive interval at one exact batch size. The
  * head geometry, cache dtype, and execution envelope are fixed implementation-profile inputs.
- * Invalid profiles or intervals throw; a legal prompt route may return zero.
+ * tail_rows selects the precision-tail partial-slot budget (0 = single source). Invalid
+ * profiles or intervals throw; a legal prompt route may return zero.
  */
 [[nodiscard]] std::size_t causal_softmax_attention_workspace_capacity_bytes(
     AttentionHeadGeometry geometry, DType cache_dtype, CausalAttentionExecutionEnvelope envelope,
-    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens);
+    std::int32_t batch_size, std::int32_t min_tokens, std::int32_t max_tokens, int tail_rows = 0);
 
 /**
  * Non-causal grouped-query attention over persistent context plus one live query block.

@@ -136,6 +136,7 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                      .attention_head_dim        = TextConfig::head_dim,
                      .kv_dtype                  = plan.kv_dtype,
                      .kv_quant_group            = plan.kv_quant_group,
+                     .kv_tail_tokens            = plan.kv_tail_tokens,
                      .enable_mtp                = plan.features.mtp(),
                      .kv_table_rows             = static_cast<std::int32_t>(plan.max_concurrency),
                      .text_physical_page_groups = physical_pages,
@@ -286,7 +287,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         (void)workspace_recipe::text_attention_results<TextConfig>(layout, last);
         scratch(layout, ops::causal_softmax_attention_workspace_capacity_bytes(
                             {TextConfig::head_dim, TextConfig::query_heads, TextConfig::kv_heads},
-                            plan.kv_dtype, envelope, batch_size, min_width, max_width));
+                            plan.kv_dtype, envelope, batch_size, min_width, max_width,
+                            static_cast<std::int32_t>(plan.kv_tail_tokens)));
         scratch(layout, Variant::attention_output_projection_workspace_capacity_bytes(
                             plan.weights_profile, phase, first, last));
     };
@@ -580,6 +582,14 @@ void validate_target_options(DeviceContext& device, const EngineOptions& options
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("max_concurrency must be in [1,8]");
     }
+    if (options.kv_tail_tokens != 0 &&
+        (options.kv_tail_tokens < 64 || options.kv_tail_tokens > 16384 ||
+         options.kv_tail_tokens % 64 != 0)) {
+        throw std::invalid_argument("kv_tail_tokens must be 0 or a multiple of 64 in [64, 16384]");
+    }
+    if (options.kv_tail_tokens != 0 && options.kv_cache == KvCacheStorage::Fp8E4M3Row256) {
+        throw std::invalid_argument("kv_tail_tokens requires BF16 or INT8 KV storage");
+    }
     const std::uint32_t logical_pages = page_count(options.max_context);
     const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
@@ -659,6 +669,7 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->context_cache       = inputs.context_cache;
     impl->kv_dtype            = inputs.kv_dtype;
     impl->kv_quant_group      = inputs.kv_quant_group;
+    impl->kv_tail_tokens      = inputs.kv_tail_tokens;
     impl->persistent          = persistent_layout(*impl);
     impl->workspace           = build_workspace_plan(*impl);
     if (impl->use_cuda_graph) {
@@ -726,6 +737,7 @@ make_sequence_planner_impl(DeviceContext& device, const EngineOptions& options,
         .speculative_backend = options.speculative.backend,
         .kv_dtype            = kv_profile.dtype,
         .kv_quant_group      = kv_profile.quant_group,
+        .kv_tail_tokens      = options.kv_tail_tokens,
         .proposal_head       = options.speculative.proposal_head,
         .features            = qwen3_6::startup_features(options),
         .use_cuda_graph      = options.use_cuda_graph,

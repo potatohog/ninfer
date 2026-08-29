@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <math_constants.h>
 
+#include <climits>
 #include <cstdint>
 
 namespace ninfer::ops {
@@ -137,6 +138,36 @@ __device__ __forceinline__ int causal_small_t_tc_swz32(int row, int col) {
     return (((col >> 3) ^ (row & 3)) << 3) | (col & 7);
 }
 
+// Precision-tail source split shared by every causal small-T kernel and the reducer. The ring
+// holds C = tail_rows + 64 rows per table row; the body owns [0, body_end) and the ring owns
+// [body_end, window). body_end is the max of the page-aligned tail base, the ring-validity
+// watermark (restored histories start the tail at the restored length), and the ring horizon
+// (rows further back were overwritten). The newest C rows always sit in the ring: the ring
+// covered [window - C, window) before this round, and the append mirrors [first_pos, window) of
+// the current columns. tail_rows <= 0 leaves the single-source range [0, window) untouched.
+__device__ __forceinline__ int causal_small_t_ring_rows(int tail_rows) { return tail_rows + 64; }
+
+__device__ __forceinline__ int causal_small_t_body_end(int window, int watermark_row, int tail_rows) {
+    if (tail_rows <= 0) { return INT_MAX; }
+    const int base = (window > tail_rows) ? ((window - tail_rows) & ~63) : 0;
+    int body_end   = base;
+    if (watermark_row > body_end) { body_end = watermark_row; }
+    const int horizon = window - causal_small_t_ring_rows(tail_rows);
+    if (horizon > body_end) { body_end = horizon; }
+    return (body_end < 0) ? 0 : body_end;
+}
+
+// Rows the append must mirror into the ring this round: the current columns that fall in the
+// tail domain, [max(first_pos, body_end), window). Everything before first_pos is already in
+// the ring from the previous round (the horizon bound guarantees it) and needs no rewrite.
+__device__ __forceinline__ int causal_small_t_mirror_start(int window, int first_pos, int body_end,
+                                                           int tail_rows) {
+    if (tail_rows <= 0) { return INT_MAX; }
+    int start = (first_pos > body_end) ? first_pos : body_end;
+    if (start < 0) { start = 0; }
+    return (start < window) ? start : window;
+}
+
 // Signed int8 QK MMA, k=32 contraction. A = 16x32 s8 (4 regs/thread, 4 s8 each),
 // B = 8x32 s8 col-major (2 regs/thread), D = 16x8 s32 (4 regs/thread). The A/B
 // register byte layout is identical to the m16n8k16 bf16 fragments loaded by
@@ -158,7 +189,9 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     const __nv_bfloat16* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
-    std::int32_t split_count, __nv_bfloat16* out) {
+    std::int32_t split_count, std::int32_t body_split_count, std::int32_t tail_split_count,
+    const std::int32_t* tail_watermark, const std::int32_t* table_rows,
+    std::int32_t tail_rows, __nv_bfloat16* out) {
     static_assert(DChunk > 0 && DChunk <= kCausalHeadDim);
 
     const int q_head      = static_cast<int>(blockIdx.x);
@@ -194,15 +227,38 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     }
 
     const int window = last_pos + 1;
-    const int active_split_count =
-        causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
+    // Two-source merge: the body partial owns slot segment [0, body_active) and the tail partial
+    // owns [body_split_count, body_split_count + tail_active). Both segment split counts follow
+    // the same device policy as their launches, keyed on each segment's visible key count.
+    // tail_rows <= 0 (tail_watermark null) keeps the single-source merge over the full window.
+    const int table_row = table_rows == nullptr ? 0 : table_rows[batch];
+    int body_end_b = INT_MAX;
+    int body_active = 0;
+    int tail_active = 0;
+    if (tail_watermark == nullptr) {
+        body_active = causal_small_t_active_splits<Geometry, Int8>(window, body_split_count,
+                                                                   tokens);
+    } else {
+        const int wm = tail_watermark[table_row];
+        body_end_b = causal_small_t_body_end(window, wm, tail_rows);
+        if (body_end_b > window) { body_end_b = window; }
+        body_active = causal_small_t_active_splits<Geometry, Int8>(window, body_split_count,
+                                                                   tokens);
+        tail_active = causal_small_t_active_splits<Geometry, false>(window - body_end_b,
+                                                                    tail_split_count, tokens);
+    }
 
     __shared__ float reduce[256];
 
     float local_m = -CUDART_INF_F;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
+    for (int split = tid; split < body_active; split += blockDim.x) {
         local_m = fmaxf(
             local_m, partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)]);
+    }
+    for (int split = tid; split < tail_active; split += blockDim.x) {
+        local_m = fmaxf(local_m,
+                        partial_m[causal_partial_stat_index<Geometry>(
+                            q_head, token, body_split_count + split, tokens)]);
     }
     reduce[tid] = local_m;
     __syncthreads();
@@ -223,13 +279,24 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     }
 
     float local_l = 0.0f;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
+    for (int split = tid; split < body_active; split += blockDim.x) {
         const float tile_l =
             partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)];
         if (tile_l > 0.0f) {
             local_l +=
                 tile_l *
                 expf(partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
+                     head_m);
+        }
+    }
+    for (int split = tid; split < tail_active; split += blockDim.x) {
+        const int slot = body_split_count + split;
+        const float tile_l =
+            partial_l[causal_partial_stat_index<Geometry>(q_head, token, slot, tokens)];
+        if (tile_l > 0.0f) {
+            local_l +=
+                tile_l *
+                expf(partial_m[causal_partial_stat_index<Geometry>(q_head, token, slot, tokens)] -
                      head_m);
         }
     }
@@ -247,7 +314,7 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
 
     float numerator = 0.0f;
     if (head_l > 0.0f) {
-        for (int split = 0; split < active_split_count; ++split) {
+        for (int split = 0; split < body_active; ++split) {
             const float tile_l =
                 partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)];
             if (tile_l <= 0.0f) { continue; }
@@ -256,6 +323,18 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
                      head_m);
             numerator += __bfloat162float(partial_acc[causal_partial_acc_index<Geometry>(
                              q_head, d, token, split, tokens)]) *
+                         weight;
+        }
+        for (int split = 0; split < tail_active; ++split) {
+            const int slot = body_split_count + split;
+            const float tile_l =
+                partial_l[causal_partial_stat_index<Geometry>(q_head, token, slot, tokens)];
+            if (tile_l <= 0.0f) { continue; }
+            const float weight =
+                expf(partial_m[causal_partial_stat_index<Geometry>(q_head, token, slot, tokens)] -
+                     head_m);
+            numerator += __bfloat162float(partial_acc[causal_partial_acc_index<Geometry>(
+                             q_head, d, token, slot, tokens)]) *
                          weight;
         }
     }

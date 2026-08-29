@@ -399,11 +399,13 @@ void TextContext::mtp_forward_tail(Tensor& x, const Tensor& ah, const Tensor& po
         ops::causal_softmax_attention(
             q_batch, k_batch, v_batch, position_batch, *active_valid_columns_,
             *active_backend_kv_table_rows_, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-            batch_mtp_kv_->batch_layer_view(0), envelope, work_, a_batch, s);
+            batch_mtp_kv_->batch_layer_view(0), ops::CausalTailDescriptor{}, envelope, work_,
+            a_batch, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, positions, Tensor{}, io_.backend_kv_table_row,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_mtp_kv_->batch_layer_view(0), envelope, work_, a, s);
+                                      batch_mtp_kv_->batch_layer_view(0),
+                                      ops::CausalTailDescriptor{}, envelope, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);
 
@@ -846,6 +848,19 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
     Tensor a = results.attention.view({kCfg.head_dim, kCfg.n_q, T});
     const Tensor& kv_table_rows =
         active_kv_table_rows_ != nullptr ? *active_kv_table_rows_ : io_.text_kv_table_row;
+    // KV precision tail: an exact BF16 ring of the newest rows per table row; the decode
+    // attention reads the tail rows through it in addition to the body cache. A default
+    // descriptor keeps the single-source attention exactly when the tail is disabled.
+    ops::CausalTailDescriptor attn_tail;
+    if (batch_text_kv_->has_tail()) {
+        const qwen3_6::PagedKVTailView ring = batch_text_kv_->tail_layer_view(fidx);
+        attn_tail                           = ops::CausalTailDescriptor{
+            .k_ring    = ring.k,
+            .v_ring    = ring.v,
+            .watermark = ring.watermark,
+            .tail_rows = ring.tail_rows,
+        };
+    }
     if (active_sequence_batch_ != 0) {
         const std::int32_t width = active_sequence_width_;
         if (width <= 0 || width * active_sequence_batch_ != T) {
@@ -860,11 +875,12 @@ void TextContext::attn_mix(const FullLayerW& w, Tensor& x, int fidx, Phase ph) {
         ops::causal_softmax_attention(q_batch, k_batch, v_batch, position_batch, valid,
                                       kv_table_rows, {kCfg.head_dim, kCfg.n_q, kCfg.n_kv},
                                       kAttnScale, batch_text_kv_->batch_layer_view(fidx),
-                                      *active_causal_attention_envelope_, work_, a_batch, s);
+                                      attn_tail, *active_causal_attention_envelope_, work_,
+                                      a_batch, s);
     } else {
         ops::causal_softmax_attention(qn, kn, v, cache_positions, Tensor{}, kv_table_rows,
                                       {kCfg.head_dim, kCfg.n_q, kCfg.n_kv}, kAttnScale,
-                                      batch_text_kv_->batch_layer_view(fidx),
+                                      batch_text_kv_->batch_layer_view(fidx), attn_tail,
                                       *active_causal_attention_envelope_, work_, a, s);
     }
     ops::sigmoid_mul(gate, a, s);

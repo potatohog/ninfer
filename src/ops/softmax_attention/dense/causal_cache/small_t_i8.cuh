@@ -61,8 +61,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         std::int8_t* cache_v_i8, __half* cache_k_scale, __half* cache_v_scale,
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
-        std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-        __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
+        std::int32_t column_begin, std::int32_t logical_capacity,
+        const std::int32_t* tail_watermark, std::int32_t tail_rows, std::int32_t slot_stride,
+        float scale, __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -139,9 +140,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         block_tables + static_cast<std::int64_t>(table_row) * table_stride;
     if constexpr (MultiBatch) {
         partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
-                       TokenTile * split_count;
-        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
-        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * split_count;
+                       TokenTile * slot_stride;
+        partial_m += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * slot_stride;
+        partial_l += static_cast<std::int64_t>(batch) * Geometry::QHeads * TokenTile * slot_stride;
     }
 
     auto write_neutral = [&]() {
@@ -198,9 +199,20 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         write_neutral();
         return;
     }
+    // Precision tail: truncate the read range to the body domain [0, body_end). The append keeps
+    // the full-window partition above, so every current row still reaches the body cache; the
+    // rows [body_end, window) are read by the tail partial through the BF16 ring instead.
+    const int body_end =
+        (tail_watermark == nullptr) ? INT_MAX
+                                    : causal_small_t_body_end(window, tail_watermark[table_row],
+                                                              tail_rows);
+    const int read_end = (body_end < split_end) ? body_end : split_end;
     const int first_tile = (split_start / Bc) * Bc;
-    const int key_blocks = div_up(split_end - first_tile, Bc);
+    const int key_blocks = div_up(read_end - first_tile, Bc);
     const int first_page = first_tile >> kPagedKVPageShift;
+    // The block-table load covers the full split range: the append owns rows [split_start,
+    // split_end) even when the read range is truncated by the precision tail, while the key
+    // loop dereferences only the first key_blocks pages.
     const int page_count = ((split_end - 1) >> kPagedKVPageShift) - first_page + 1;
     for (int page = tid; page < page_count; page += Threads) {
         physical_pages_s[page] = block_table[first_page + page];
@@ -283,6 +295,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         }
         __syncthreads();
+        // The ring mirror and the watermark refresh are owned by the tail partial (launched
+        // after this kernel): its split partition covers [body_end, window), which contains
+        // every row the mirror must write, so the body kernel never touches the ring.
     }
 
     for (int i = tid; i < Br * D; i += Threads) { q_i8[i] = 0; }
@@ -359,7 +374,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     auto issue_kv_tile = [&](int tile_k0, int physical_page) {
         for (int key_l = tid; key_l < Bc; key_l += Threads) {
             const int key = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < read_end) {
                 const std::int64_t off = kv_cache_int8_quant_scale_index<Geometry>(
                     physical_page, kv_head, 0, key & kPagedKVPageMask);
                 ninfer::ops::cp_async<8>(&k_scale_s[key_l * Groups], &cache_k_scale[off]);
@@ -375,7 +390,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             const int dc    = chunk - key_l * (D / 16);
             const int d     = dc * 16;
             const int key   = tile_k0 + key_l;
-            if (key >= split_start && key < split_end) {
+            if (key >= split_start && key < read_end) {
                 const std::int64_t off = kv_cache_int8_quant_code_index<Geometry>(
                     physical_page, kv_head, d, key & kPagedKVPageMask);
                 std::int8_t* dst = &k_i8[key_l * D + causal_small_t_tc_swz(key_l, dc * 8) * 2];
@@ -473,19 +488,19 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
                 score[nt][0] =
-                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                    (row0 < RowCount && key0 >= split_start && key0 < read_end && key0 <= qabs0)
                         ? score[nt][0] * scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                    (row0 < RowCount && key1 >= split_start && key1 < read_end && key1 <= qabs0)
                         ? score[nt][1] * scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                    (row1 < RowCount && key0 >= split_start && key0 < read_end && key0 <= qabs1)
                         ? score[nt][2] * scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                    (row1 < RowCount && key1 >= split_start && key1 < read_end && key1 <= qabs1)
                         ? score[nt][3] * scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -545,7 +560,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int d        = dc * 8;
                 const int key      = k0 + key_l;
                 __nv_bfloat16* dst = &v_bf16[key_l * D + causal_small_t_tc_swz(key_l, d)];
-                if (key >= split_start && key < split_end) {
+                if (key >= split_start && key < read_end) {
                     const int grp = d >> 6;
                     float vs      = 0.0f;
                     if ((lane & 7) == 0) { vs = __half2float(v_scale_s[key_l * Groups + grp]); }
