@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace ninfer::targets::qwen3_6 {
 
@@ -19,10 +20,36 @@ struct DecoderStateSpec {
     std::int32_t kv_heads                   = 0;
     std::int32_t attention_head_dim         = 0;
     KvCacheStorage kv_storage               = KvCacheStorage::BFloat16;
+    // KV precision tail: exact BF16 ring of the newest kv_tail_tokens rows (multiple of 64) of
+    // every full-attention layer, mirrored by the text attention route. 0 disables the ring.
+    std::uint32_t kv_tail_tokens            = 0;
     bool enable_mtp                         = false;
     std::int32_t kv_table_rows              = 1;
     std::uint32_t text_physical_page_groups = 0;
     std::uint32_t mtp_physical_page_groups  = 0;
+};
+
+// KV precision-tail ring: per-table-row BF16 rings of the newest rows, one plane per
+// full-attention layer and per K/V, plus the shared per-table-row ring-validity watermark.
+// Row p of table row t sits in physical ring page t * ring_pages + (p / 64) % ring_pages at
+// page offset p % 64, where ring_pages = (tail_rows + 64) / 64; every plane has the same
+// [head_dim, 64, kv_heads, table_rows * ring_pages] layout as the body cache pages.
+struct KvTailRingLayout {
+    std::vector<TensorRegion> k_planes; // [full_attention_layers]
+    std::vector<TensorRegion> v_planes; // [full_attention_layers]
+    TensorRegion watermark;             // I32 [table_rows]
+    std::int32_t tail_rows              = 0;
+    std::int32_t ring_pages             = 0;
+
+    [[nodiscard]] std::size_t payload_bytes() const noexcept;
+};
+
+// Bound per-layer view of the precision-tail ring, ready for the causal attention Op.
+struct PagedKVTailView {
+    Tensor k;
+    Tensor v;
+    std::int32_t* watermark = nullptr; // ring-validity watermark; mutated by the Op
+    std::int32_t tail_rows        = 0;
 };
 
 struct PagedKVCacheLayout {
@@ -32,8 +59,11 @@ struct PagedKVCacheLayout {
     std::uint32_t max_context = 0;
     std::int32_t kv_heads     = 0;
     PagedKVStorageLayout layer_storage;
+    std::optional<KvTailRingLayout> kv_tail;
 
-    [[nodiscard]] std::size_t payload_bytes() const noexcept { return pages.payload_bytes(); }
+    [[nodiscard]] std::size_t payload_bytes() const noexcept {
+        return pages.payload_bytes() + (kv_tail ? kv_tail->payload_bytes() : 0);
+    }
 };
 
 class PagedKVCache;
@@ -82,6 +112,16 @@ public:
 
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
 
+    [[nodiscard]] bool has_tail() const noexcept { return !tail_k_.empty(); }
+
+    [[nodiscard]] std::int32_t tail_rows() const noexcept {
+        return tail_watermark_.data != nullptr ? tail_rows_ : 0;
+    }
+
+    [[nodiscard]] PagedKVTailView tail_layer_view(std::uint32_t layer) const;
+
+    [[nodiscard]] Tensor tail_watermark() const;
+
 private:
     friend class PagedKVCacheView;
     [[nodiscard]] PagedKVLayerView layer_view(std::uint32_t layer, Tensor block_table) const;
@@ -92,13 +132,19 @@ private:
     std::uint32_t max_context_ = 0;
     std::int32_t kv_heads_     = 0;
     PagedKVStorageLayout layer_storage_;
+    std::vector<Tensor> tail_k_;
+    std::vector<Tensor> tail_v_;
+    Tensor tail_watermark_;
+    std::int32_t tail_rows_ = 0;
 };
 
 struct DecoderStateLayout {
     PagedKVCacheLayout text_kv;
     std::optional<PagedKVCacheLayout> mtp_kv;
 
-    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept;
+    [[nodiscard]] std::size_t kv_payload_bytes() const noexcept {
+        return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
+    }
 };
 
 [[nodiscard]] DecoderStateLayout plan_decoder_state(LayoutBuilder& builder,

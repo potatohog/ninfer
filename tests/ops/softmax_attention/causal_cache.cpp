@@ -32,6 +32,8 @@ constexpr std::int32_t kNvfp4QuantGroup  = 16;
 constexpr std::int32_t kNvfp4QuantGroups = kHeadDim / kNvfp4QuantGroup;
 constexpr std::int32_t kNvfp4CodeBytes   = kHeadDim / 2;
 constexpr float kAttentionScale          = 0.0625f;
+constexpr std::int32_t kPagedKVPageShift = 6;
+constexpr std::int32_t kPagedKVPageMask  = kPagedKVPageSize - 1;
 constexpr std::uint16_t kOutputCanary    = 0x7fc1u;
 
 // A1 and A3 use one fixed criterion for each registered storage profile; token count, geometry,
@@ -1813,7 +1815,8 @@ int run_a1_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
         [&](cudaStream_t stream) {
             ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row,
                                           op_geometry(geometry), kAttentionScale,
-                                          cache.batch_view(), envelope, workspace, tout, stream);
+                                          cache.batch_view(), ops::CausalTailDescriptor{},
+                                          envelope, workspace, tout, stream);
         },
         test_case.graph_replay);
 
@@ -1908,6 +1911,259 @@ int run_a3_case(const Geometry& geometry, KvCacheStorage storage, const Attentio
     failures += workspace_buffer.verify_guards((label + " workspace").c_str());
     if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
         std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    failures += cache.verify_guards(label);
+    return failures;
+}
+
+// ---------------------------------------------------------------------------
+// Precision tail (dual-source): the body reads [0, body_end) through the
+// represented quantized cache and the tail reads [body_end, window) through the
+// exact BF16 ring. The oracle reads each key through its own storage boundary,
+// never a production staging cast or reduction tree.
+// ---------------------------------------------------------------------------
+
+std::size_t ring_element_offset(const Geometry& geometry, std::int32_t table_row,
+                                std::int32_t ring_pages, std::int32_t head, std::int32_t position,
+                                std::int32_t d) {
+    const std::int32_t ring_page =
+        table_row * ring_pages + ((position >> kPagedKVPageShift) % ring_pages);
+    const std::int32_t page_offset = position & kPagedKVPageMask;
+    return static_cast<std::size_t>(kHeadDim) * kPagedKVPageSize *
+               (static_cast<std::int32_t>(head) +
+                static_cast<std::int32_t>(geometry.kv_heads) * ring_page) +
+           static_cast<std::size_t>(kHeadDim) * static_cast<std::int32_t>(page_offset) +
+           static_cast<std::size_t>(d);
+}
+
+std::vector<double> ideal_attention_tail(const std::vector<float>& q, const HostCache& body,
+                                         const std::vector<std::uint16_t>& tail_k,
+                                         const std::vector<std::uint16_t>& tail_v,
+                                         std::int32_t tail_split,
+                                         const std::vector<std::int32_t>& positions) {
+    const Geometry& geometry = body.geometry;
+    const std::int32_t tokens = static_cast<std::int32_t>(positions.size());
+    std::vector<double> output(static_cast<std::size_t>(kHeadDim) *
+                               static_cast<std::size_t>(geometry.q_heads) *
+                               static_cast<std::size_t>(tokens));
+    naive_dense_softmax_attention(
+        op_geometry(geometry), tokens, positions.back() + 1, static_cast<double>(kAttentionScale),
+        [&](int d, int head, int token) {
+            return static_cast<double>(q[q_index(geometry, head, d, token)]);
+        },
+        [&](int d, int head, int position) {
+            if (position >= tail_split) {
+                const std::size_t code =
+                    cache_index(geometry, body.logical_capacity, head, position, d);
+                return static_cast<double>(bf16_to_f32(tail_k[code]));
+            }
+            return cache_value(body, true, head, position, d);
+        },
+        [&](int d, int head, int position) {
+            if (position >= tail_split) {
+                const std::size_t code =
+                    cache_index(geometry, body.logical_capacity, head, position, d);
+                return static_cast<double>(bf16_to_f32(tail_v[code]));
+            }
+            return cache_value(body, false, head, position, d);
+        },
+        [&](int token, int position) {
+            return position <= positions[static_cast<std::size_t>(token)];
+        },
+        [&](int d, int head, int token, double value) {
+            output[q_index(geometry, head, d, token)] = value;
+        });
+    return output;
+}
+
+struct TailCase {
+    std::int32_t base;
+    std::int32_t tokens;
+    std::int32_t tail_rows;
+    std::int32_t watermark;
+    std::uint32_t seed;
+};
+
+// Storage-boundary split for a decode round: body_end is the ring-validity watermark, the
+// page-aligned tail base, and the ring horizon, clamped to [0, window). It is a property of the
+// represented storage layout (which rows the ring holds), not a production reduction detail.
+std::int32_t tail_body_end(std::int32_t window, std::int32_t watermark, std::int32_t tail_rows) {
+    const std::int32_t base = (window > tail_rows) ? ((window - tail_rows) & ~63) : 0;
+    std::int32_t body_end = base;
+    if (watermark > body_end) { body_end = watermark; }
+    const std::int32_t horizon = window - (tail_rows + 64);
+    if (horizon > body_end) { body_end = horizon; }
+    if (body_end < 0) { body_end = 0; }
+    return (body_end < window) ? body_end : window;
+}
+
+int run_a1_tail_case(const Geometry& geometry, DType dtype, const TailCase& tc,
+                     MappingPattern mapping) {
+    if (dtype == DType::FP8_E4M3FN) { return 0; }
+    const std::int32_t window = tc.base + tc.tokens;
+    const std::int32_t max_context = std::max(window + 3, tc.tail_rows + 64);
+    const std::int32_t logical_capacity = align_up_page(max_context);
+    const std::size_t q_elements = static_cast<std::size_t>(kHeadDim) *
+                                   static_cast<std::size_t>(geometry.q_heads) *
+                                   static_cast<std::size_t>(tc.tokens);
+    const std::size_t kv_elements = static_cast<std::size_t>(kHeadDim) *
+                                    static_cast<std::size_t>(geometry.kv_heads) *
+                                    static_cast<std::size_t>(tc.tokens);
+    std::vector<float> q = make_bf16_values(q_elements, tc.seed, -0.25f, 0.25f);
+    std::vector<float> k = make_bf16_values(kv_elements, tc.seed + 1u, -0.25f, 0.25f);
+    std::vector<float> v = make_bf16_values(kv_elements, tc.seed + 2u, -1.0f, 1.0f);
+    inject_codec_edges(geometry, tc.tokens, k, v);
+    std::vector<std::int32_t> positions(static_cast<std::size_t>(tc.tokens));
+    for (std::int32_t token = 0; token < tc.tokens; ++token) {
+        positions[static_cast<std::size_t>(token)] = tc.base + token;
+    }
+
+    // Body cache: quantized history + the current tokens (the fused append writes them too).
+    const HostCache initial = make_cache(geometry, dtype, max_context, tc.seed + 10u);
+    HostCache expected      = initial;
+    append_cache(expected, k, v, positions);
+    const std::int32_t body_end = tail_body_end(window, tc.watermark, tc.tail_rows);
+
+    // Exact tail values [body_end, window): base history through its represented logical BF16
+    // (the same seed make_cache quantized) and current tokens through the input.
+    const std::size_t elements = cache_elements(geometry, logical_capacity);
+    std::vector<float> logical_k = make_bf16_values(elements, tc.seed + 10u, -0.25f, 0.25f);
+    std::vector<float> logical_v = make_bf16_values(elements, tc.seed + 11u, -1.0f, 1.0f);
+    std::vector<std::uint16_t> tail_k(elements, 0), tail_v(elements, 0);
+    for (std::int32_t p = body_end; p < window; ++p) {
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const std::size_t code = cache_index(geometry, logical_capacity, head, p, d);
+                if (p >= tc.base) {
+                    const std::size_t src = kv_input_index(geometry, head, d, p - tc.base);
+                    tail_k[code] = f32_to_bf16(k[src]);
+                    tail_v[code] = f32_to_bf16(v[src]);
+                } else {
+                    tail_k[code] = f32_to_bf16(logical_k[code]);
+                    tail_v[code] = f32_to_bf16(logical_v[code]);
+                }
+            }
+        }
+    }
+    const std::vector<double> reference = ideal_attention_tail(q, expected, tail_k, tail_v,
+                                                               body_end, positions);
+
+    DeviceCache cache(initial, mapping);
+    const std::int32_t ring_pages = (tc.tail_rows + 64) >> kPagedKVPageShift;
+    const std::size_t ring_elements = static_cast<std::size_t>(kHeadDim) *
+                                      static_cast<std::size_t>(kPagedKVPageSize) *
+                                      static_cast<std::size_t>(geometry.kv_heads) *
+                                      static_cast<std::size_t>(ring_pages);
+    std::vector<std::uint16_t> host_ring_k(ring_elements, 0), host_ring_v(ring_elements, 0);
+    for (std::int32_t p = body_end; p < window; ++p) {
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const std::size_t src = cache_index(geometry, logical_capacity, head, p, d);
+                const std::size_t dst =
+                    ring_element_offset(geometry, 0, ring_pages, head, p, d);
+                host_ring_k[dst] = tail_k[src];
+                host_ring_v[dst] = tail_v[src];
+            }
+        }
+    }
+
+    const std::vector<std::uint16_t> q_bits = to_bf16_bits(q);
+    const std::vector<std::uint16_t> k_bits = to_bf16_bits(k);
+    const std::vector<std::uint16_t> v_bits = to_bf16_bits(v);
+    GuardedDeviceBuffer dq(q_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dk(k_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dv(v_bits.size() * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dp(positions.size() * sizeof(std::int32_t));
+    GuardedDeviceBuffer dtable_row(sizeof(std::int32_t));
+    GuardedDeviceBuffer drk(ring_elements * sizeof(std::uint16_t));
+    GuardedDeviceBuffer drv(ring_elements * sizeof(std::uint16_t));
+    GuardedDeviceBuffer dwm(sizeof(std::int32_t));
+    GuardedDeviceBuffer dout(q_bits.size() * sizeof(std::uint16_t));
+    dq.copy_from_host(q_bits.data(), q_bits.size() * sizeof(std::uint16_t));
+    dk.copy_from_host(k_bits.data(), k_bits.size() * sizeof(std::uint16_t));
+    dv.copy_from_host(v_bits.data(), v_bits.size() * sizeof(std::uint16_t));
+    dp.copy_from_host(positions.data(), positions.size() * sizeof(std::int32_t));
+    drk.copy_from_host(host_ring_k.data(), ring_elements * sizeof(std::uint16_t));
+    drv.copy_from_host(host_ring_v.data(), ring_elements * sizeof(std::uint16_t));
+    const std::int32_t table_row = 0;
+    dtable_row.copy_from_host(&table_row, sizeof(table_row));
+    const std::int32_t watermark = tc.watermark;
+    dwm.copy_from_host(&watermark, sizeof(watermark));
+    std::vector<std::uint16_t> output_canary(q_bits.size(), kOutputCanary);
+    dout.copy_from_host(output_canary.data(), output_canary.size() * sizeof(std::uint16_t));
+
+    Tensor tq(dq.data(), DType::BF16, {kHeadDim, geometry.q_heads, tc.tokens});
+    Tensor tk(dk.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tc.tokens});
+    Tensor tv(dv.data(), DType::BF16, {kHeadDim, geometry.kv_heads, tc.tokens});
+    Tensor tp(dp.data(), DType::I32, {tc.tokens});
+    Tensor ttable_row(dtable_row.data(), DType::I32, {1});
+    Tensor trk(drk.data(), DType::BF16, {kHeadDim, kPagedKVPageSize, geometry.kv_heads,
+                                         ring_pages});
+    Tensor trv(drv.data(), DType::BF16, {kHeadDim, kPagedKVPageSize, geometry.kv_heads,
+                                         ring_pages});
+    Tensor tout(dout.data(), DType::BF16, {kHeadDim, geometry.q_heads, tc.tokens});
+    ops::CausalTailDescriptor tail;
+    tail.k_ring       = trk;
+    tail.v_ring       = trv;
+    tail.watermark    = static_cast<std::int32_t*>(dwm.data());
+    tail.tail_rows    = tc.tail_rows;
+    const ops::CausalAttentionExecutionEnvelope envelope{
+        static_cast<std::uint32_t>(window), static_cast<std::uint32_t>(window)};
+    const std::size_t workspace_bytes = ops::causal_softmax_attention_workspace_capacity_bytes(
+        op_geometry(geometry), dtype, envelope, 1, tc.tokens, tc.tokens, tc.tail_rows);
+    GuardedDeviceBuffer workspace_buffer(std::max<std::size_t>(workspace_bytes, 256));
+    WorkspaceArena workspace(DeviceSpan{workspace_buffer.data(), workspace_buffer.bytes()});
+
+    ops::causal_softmax_attention(tq, tk, tv, tp, Tensor{}, ttable_row, op_geometry(geometry),
+                                  kAttentionScale, cache.batch_view(), tail, envelope, workspace,
+                                  tout, nullptr);
+    cuda_synchronize();
+
+    const std::string label = std::string("causal_softmax_attention_tail ") + geometry.name +
+                              " " + cache_name(dtype) + " mapping=" + mapping_name(mapping) +
+                              " T=" + std::to_string(tc.tokens) + " keys=" +
+                              std::to_string(window) + " tail=" + std::to_string(tc.tail_rows) +
+                              " wm=" + std::to_string(tc.watermark);
+    const std::vector<std::uint16_t> output_bits =
+        copy_from_guarded<std::uint16_t>(dout, q_bits.size());
+    int failures = verify_attention(label, bf16_bits_to_double(output_bits), reference,
+                                    attention_criterion(dtype));
+    failures += verify_cache(label + " body cache", cache.snapshot(), expected, dtype == DType::BF16);
+    failures += verify_input(label + " q unchanged", dq, q_bits);
+    failures += verify_input(label + " k unchanged", dk, k_bits);
+    failures += verify_input(label + " v unchanged", dv, v_bits);
+    failures += verify_positions(label + " positions unchanged", dp, positions);
+    failures += verify_positions(label + " table row unchanged", dtable_row, {table_row});
+    failures += dout.verify_guards((label + " output").c_str());
+    failures += workspace_buffer.verify_guards((label + " workspace").c_str());
+    if (workspace.used() != 0 || workspace.peak_used() != workspace_bytes) {
+        std::cerr << label << ": workspace query/execution high-water mismatch\n";
+        ++failures;
+    }
+    // The mirror must leave the ring holding the exact tail rows [body_end, window).
+    const std::vector<std::uint16_t> ring_k_out =
+        copy_from_guarded<std::uint16_t>(drk, ring_elements);
+    const std::vector<std::uint16_t> ring_v_out =
+        copy_from_guarded<std::uint16_t>(drv, ring_elements);
+    for (std::int32_t p = body_end; p < window; ++p) {
+        for (std::int32_t head = 0; head < geometry.kv_heads; ++head) {
+            for (std::int32_t d = 0; d < kHeadDim; ++d) {
+                const std::size_t src = cache_index(geometry, logical_capacity, head, p, d);
+                const std::size_t dst = ring_element_offset(geometry, 0, ring_pages, head, p, d);
+                if (ring_k_out[dst] != tail_k[src] || ring_v_out[dst] != tail_v[src]) {
+                    std::cerr << label << ": ring mirror mismatch at p=" << p << " head=" << head
+                              << " d=" << d << "\n";
+                    ++failures;
+                    break;
+                }
+            }
+        }
+    }
+    const std::int32_t wm_out = copy_from_guarded<std::int32_t>(dwm, 1)[0];
+    const std::int32_t wm_expected = std::max(tc.watermark, window - (tc.tail_rows + 64));
+    if (wm_out != wm_expected) {
+        std::cerr << label << ": watermark " << wm_out << " < " << wm_expected << "\n";
         ++failures;
     }
     failures += cache.verify_guards(label);
@@ -2069,8 +2325,8 @@ int run_batch_case(const Geometry& geometry, KvCacheStorage storage,
     const bool masked = std::any_of(test_case.valid_columns.begin(), test_case.valid_columns.end(),
                                     [&](std::int32_t valid) { return valid != test_case.width; });
     ops::causal_softmax_attention(tq, tk, tv, tp, masked ? tvalid : Tensor{}, ttable_rows,
-                                  op_geometry(geometry), kAttentionScale, cache.view(), envelope,
-                                  workspace, tout, nullptr);
+                                  op_geometry(geometry), kAttentionScale, cache.view(),
+                                  ops::CausalTailDescriptor{}, envelope, workspace, tout, nullptr);
     cuda_synchronize();
 
     const std::string label = std::string("causal_softmax_attention batch ") + geometry.name + " " +
@@ -2383,6 +2639,25 @@ int verify_workspace_capacity_contract() {
     return failures;
 }
 
+int run_tail_cases() {
+    int failures = 0;
+    // Dual-source decode rounds. watermark == base exercises a restore-prime (tail = current
+    // tokens only); watermark < base exercises ring-resident history rows plus the input tail.
+    for (const Geometry& geometry : kGeometries) {
+        for (const DType dtype : {DType::I8, DType::BF16}) {
+            failures += run_a1_tail_case(geometry, dtype,
+                                         {640, 6, 256, 640, 701u}, MappingPattern::Identity);
+            failures += run_a1_tail_case(geometry, dtype,
+                                         {640, 6, 256, 512, 702u}, MappingPattern::Identity);
+            failures += run_a1_tail_case(geometry, dtype,
+                                         {128, 6, 128, 0, 703u}, MappingPattern::Offset);
+            failures += run_a1_tail_case(geometry, dtype,
+                                         {512, 1, 512, 512, 704u}, MappingPattern::Fragmented);
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int run_softmax_attention_nvfp4_tests() {
@@ -2427,6 +2702,7 @@ int run_softmax_attention_causal_cache_tests() {
     for (const Geometry& geometry : kGeometries) { failures += run_geometry(geometry); }
     failures += run_fp8_cases();
     failures += run_batch_cases();
+    failures += run_tail_cases();
     std::cout << (failures == 0 ? "PASS" : "FAIL")
               << " causal_softmax_attention public-contract correctness\n";
     return failures == 0 ? 0 : 1;

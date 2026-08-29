@@ -78,7 +78,7 @@ std::string serve_usage_text(const char* argv0) {
            "[--max-long-anchors-per-continuation N] "
            "[--request-log-jsonl FILE] "
            "[--response-store-max-records N] [--response-store-max-mib N] "
-           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--spec mtp|dflash --draft-tokens N] "
+           "[--kv-dtype bf16|int8|fp8|nvfp4|k8v4] [--kv-tail-tokens N] [--spec mtp|dflash --draft-tokens N] "
            "[--default-max-tokens N] [--default-thinking-budget N] "
            "[--vision] [--no-cuda-graph] [--no-prefix-reuse] "
            "[--lm-head-draft] [--no-thinking] [--preserve-thinking] [--cors] "
@@ -102,6 +102,8 @@ std::string serve_usage_text(const char* argv0) {
            "       --kv-capacity auto leaves " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            " MiB of sizing headroom\n"
+           "       --kv-tail-tokens keeps the newest N rows of every full-attention layer in an\n"
+           "       exact BF16 ring read through by decode attention; 0 disables the tail\n"
            "       --no-prefix-reuse disables compatible-prefix caching (enabled by default)\n"
            "       context cache defaults: device-state=max-concurrency, private=2x concurrency, "
            "shared=max(max-concurrency,4), anchors=2; Host state=8 slots, Host KV=8192 MiB\n"
@@ -261,6 +263,17 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.device = parse_nonnegative_int(require_value("--device"), "device");
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kv-tail-tokens") {
+            const std::uint32_t tail = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--kv-tail-tokens"), "kv-tail-tokens"));
+            if (tail > 16384) {
+                throw std::invalid_argument("--kv-tail-tokens must be in [0,16384]");
+            }
+            if (tail != 0 && (tail < 64 || tail % 64 != 0)) {
+                throw std::invalid_argument(
+                    "--kv-tail-tokens must be 0 or a multiple of 64 in [64,16384]");
+            }
+            options.kv_tail_tokens = tail;
         } else if (arg == "--spec") {
             options.speculative.backend =
                 product::parse_speculative_backend(require_value("--spec"));
@@ -357,6 +370,12 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--prefill-chunk must be a positive multiple of 128");
     }
     product::validate_speculative_cli_options(options.speculative);
+    if (options.kv_tail_tokens != 0 &&
+        (options.kv_cache == KvCacheStorage::Fp8E4M3Row256 ||
+         options.kv_cache == KvCacheStorage::Nvfp4Group16 ||
+         options.kv_cache == KvCacheStorage::Fp8KeyNvfp4Value)) {
+        throw std::invalid_argument("--kv-tail-tokens requires the bf16 or int8 KV dtype");
+    }
     if (default_max_tokens_explicit) {
         if (options.default_max_tokens <= 0) {
             throw std::invalid_argument("--default-max-tokens must be positive");

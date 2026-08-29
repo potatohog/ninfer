@@ -9,6 +9,7 @@
 #include "core/device.h" // CUDA_CHECK
 
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -89,23 +90,41 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
 void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tensor& v,
                                     const Tensor& positions, const Tensor& valid_columns,
                                     const Tensor& table_rows, float scale,
-                                    PagedKVBatchLayerView cache, Tensor& out, cudaStream_t stream) {
+                                    PagedKVBatchLayerView cache, Tensor& out,
+                                    const CausalTailDescriptor& tail, cudaStream_t stream) {
     if (cache.storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        if (tail.tail_rows > 0) {
+            throw std::invalid_argument(
+                "causal_attention_prompt_launch: precision tail requires I8 or BF16 KV");
+        }
         causal_attention_prompt_k8v4_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                             cache, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Nvfp4Group16) {
+        if (tail.tail_rows > 0) {
+            throw std::invalid_argument(
+                "causal_attention_prompt_launch: precision tail requires I8 or BF16 KV");
+        }
         causal_attention_prompt_nvfp4_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                              cache, out, stream);
         return;
     }
     if (cache.storage == KvCacheStorage::Fp8E4M3Row256) {
+        if (tail.tail_rows > 0) {
+            throw std::invalid_argument(
+                "causal_attention_prompt_launch: precision tail requires I8 or BF16 KV");
+        }
         causal_attention_prompt_fp8_launch(q, k, v, positions, valid_columns, table_rows, scale,
                                            cache, out, stream);
         return;
     }
     kv_cache_append_batch_launch(k, v, positions, valid_columns, table_rows, cache, stream);
+    if (tail.tail_rows > 0) {
+        // The body append is complete; mirror the current tail rows into the ring before the
+        // body attention so the following decode reads them through the tail partial.
+        causal_attention_tail_mirror_launch(k, v, positions, table_rows, tail, stream);
+    }
     const auto launch = [&]<bool Masked>() {
         const PagedKVBatchMetadata<Masked> metadata{
             .tables = static_cast<const std::int32_t*>(cache.block_tables.data),

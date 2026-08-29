@@ -952,6 +952,11 @@ ProgramImplCore::ProgramImplCore(const LoadedModelData& model_in, const Sequence
 
     set_device_i32(io.text_kv_table_row, 0);
     set_device_i32(io.backend_kv_table_row, 0);
+    if (decoder->text_kv.has_tail()) {
+        // Fresh program: every table row primes its tail ring from position 0.
+        const Tensor watermark = decoder->text_kv.tail_watermark();
+        CUDA_CHECK(cudaMemsetAsync(watermark.data, 0, watermark.bytes(), device.stream));
+    }
 
     host_tokens = static_cast<TokenId*>(round_host.data());
     if (ordinary_host) {
@@ -5157,6 +5162,21 @@ void ProgramImplCore::enqueue_materialization_transfers(MaterializationTransacti
         };
     enqueue_kv(*text_kv_pages, transaction.text_restores, transaction.text_restore_destinations,
                runtime::ContextResourceClass::MainKV);
+    if (!transaction.text_restores.empty() && transaction.root_text_address &&
+        transaction.text_activation_frontier && decoder->text_kv.has_tail()) {
+        // The tail ring is primed only by live rounds: restored history advances the row's ring
+        // watermark to the activation frontier so the first live round reads the tail only from
+        // rows its own mirror writes (the ring held another sequence's residue before).
+        const std::int32_t row =
+            text_kv_addresses->bound_row(*transaction.root_text_address);
+        if (row >= 0) {
+            const std::int32_t frontier =
+                static_cast<std::int32_t>(*transaction.text_activation_frontier);
+            CUDA_CHECK(cudaMemcpyAsync(
+                static_cast<std::int32_t*>(decoder->text_kv.tail_watermark().data) + row,
+                &frontier, sizeof(frontier), cudaMemcpyHostToDevice, device.transfer_stream));
+        }
+    }
     if (!transaction.backend_restores.empty()) {
         enqueue_kv(*backend_kv_pages, transaction.backend_restores,
                    transaction.backend_restore_destinations,

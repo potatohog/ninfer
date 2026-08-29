@@ -59,11 +59,55 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
 
 } // namespace
 
+std::size_t KvTailRingLayout::payload_bytes() const noexcept {
+    std::size_t bytes = 0;
+    for (const TensorRegion& plane : k_planes) { bytes += plane.region.bytes; }
+    for (const TensorRegion& plane : v_planes) { bytes += plane.region.bytes; }
+    return bytes + watermark.region.bytes;
+}
+
+std::optional<KvTailRingLayout> plan_kv_tail_ring(LayoutBuilder& builder,
+                                                  const DecoderStateSpec& spec) {
+    if (spec.kv_tail_tokens == 0) { return std::nullopt; }
+    if (spec.kv_storage == KvCacheStorage::Fp8E4M3Row256 ||
+        spec.kv_storage == KvCacheStorage::Nvfp4Group16 ||
+        spec.kv_storage == KvCacheStorage::Fp8KeyNvfp4Value) {
+        throw std::invalid_argument("KV precision tail requires BF16 or INT8 KV storage");
+    }
+    const std::uint32_t tail_rows = spec.kv_tail_tokens;
+    if (tail_rows < 64 || tail_rows > 16384 || tail_rows % 64 != 0 || spec.full_attention_layers == 0 ||
+        spec.kv_heads <= 0 || spec.attention_head_dim != 256 || spec.kv_table_rows <= 0) {
+        throw std::invalid_argument("KV precision tail geometry is invalid");
+    }
+    const std::uint32_t ring_pages = (tail_rows + 64u) / 64u;
+    const std::uint32_t ring_rows  = spec.kv_table_rows * static_cast<std::uint32_t>(ring_pages);
+    if (ring_rows == 0 || ring_rows > static_cast<std::uint32_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::overflow_error("KV precision tail ring pages exceed int32");
+    }
+    KvTailRingLayout layout;
+    layout.tail_rows  = static_cast<std::int32_t>(tail_rows);
+    layout.ring_pages = static_cast<std::int32_t>(ring_pages);
+    layout.k_planes.reserve(spec.full_attention_layers);
+    layout.v_planes.reserve(spec.full_attention_layers);
+    for (std::uint32_t layer = 0; layer < spec.full_attention_layers; ++layer) {
+        layout.k_planes.push_back(builder.add_tensor(
+            DType::BF16, {spec.attention_head_dim, 64, spec.kv_heads, static_cast<std::int32_t>(ring_rows)},
+            256, "kv tail ring k"));
+        layout.v_planes.push_back(builder.add_tensor(
+            DType::BF16, {spec.attention_head_dim, 64, spec.kv_heads, static_cast<std::int32_t>(ring_rows)},
+            256, "kv tail ring v"));
+    }
+    layout.watermark =
+        builder.add_tensor(DType::I32, {spec.kv_table_rows, 1, 1, 1}, 256, "kv tail watermark");
+    return layout;
+}
+
 DecoderStateLayout plan_decoder_state(LayoutBuilder& builder, const DecoderStateSpec& spec) {
     DecoderStateLayout layout;
     layout.text_kv = plan_cache(builder, spec.full_attention_layers, spec.capacity, spec.kv_heads,
                                 spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
                                 spec.text_physical_page_groups);
+    layout.text_kv.kv_tail = plan_kv_tail_ring(builder, spec);
     if (spec.enable_mtp) {
         layout.mtp_kv = plan_cache(builder, spec.mtp_layers, spec.capacity, spec.kv_heads,
                                    spec.attention_head_dim, spec.kv_storage, spec.kv_table_rows,
@@ -80,6 +124,32 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
         static_cast<std::size_t>(layers_) * layer_storage_.planes_per_layer()) {
         throw std::invalid_argument("Paged KV layer plane inventory is inconsistent");
     }
+    if (layout.kv_tail) {
+        const auto& tail = *layout.kv_tail;
+        tail_k_.reserve(tail.k_planes.size());
+        tail_v_.reserve(tail.v_planes.size());
+        for (const TensorRegion& plane : tail.k_planes) { tail_k_.push_back(plane.bind(backing)); }
+        for (const TensorRegion& plane : tail.v_planes) { tail_v_.push_back(plane.bind(backing)); }
+        tail_watermark_ = tail.watermark.bind(backing);
+        tail_rows_      = tail.tail_rows;
+    }
+}
+
+PagedKVTailView PagedKVCache::tail_layer_view(std::uint32_t layer) const {
+    if (layer >= tail_k_.size() || layer >= layers_) {
+        throw std::out_of_range("KV precision tail layer is out of range");
+    }
+    return PagedKVTailView{
+        .k         = tail_k_[layer],
+        .v         = tail_v_[layer],
+        .watermark = static_cast<std::int32_t*>(tail_watermark_.data),
+        .tail_rows = tail_rows_,
+    };
+}
+
+Tensor PagedKVCache::tail_watermark() const {
+    if (tail_watermark_.data == nullptr) { throw std::logic_error("KV precision tail is absent"); }
+    return tail_watermark_;
 }
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, Tensor block_table) noexcept
@@ -132,10 +202,6 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .num_kv_heads  = direct.num_kv_heads,
         .storage       = direct.storage,
     };
-}
-
-std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
-    return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }
 
 DecoderState::DecoderState(DeviceSpan backing, const DecoderStateLayout& layout)
