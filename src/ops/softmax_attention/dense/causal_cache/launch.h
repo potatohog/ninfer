@@ -40,10 +40,6 @@ std::int32_t causal_attention_tail_split_capacity(std::int32_t q_heads, std::int
                                                   CausalAttentionExecutionEnvelope envelope,
                                                   std::int32_t tail_rows);
 
-std::int32_t causal_attention_split_capacity(std::int32_t q_heads, std::int32_t tokens,
-                                             DType cache_dtype,
-                                             CausalAttentionExecutionEnvelope envelope);
-
 bool causal_attention_uses_small_t(std::int32_t tokens);
 
 CausalAttentionRoute causal_attention_resolve_route(std::int32_t q_heads, std::int32_t width,
