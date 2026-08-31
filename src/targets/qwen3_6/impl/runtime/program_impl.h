@@ -5162,21 +5162,6 @@ void ProgramImplCore::enqueue_materialization_transfers(MaterializationTransacti
         };
     enqueue_kv(*text_kv_pages, transaction.text_restores, transaction.text_restore_destinations,
                runtime::ContextResourceClass::MainKV);
-    if (!transaction.text_restores.empty() && transaction.root_text_address &&
-        transaction.text_activation_frontier && decoder->text_kv.has_tail()) {
-        // The tail ring is primed only by live rounds: restored history advances the row's ring
-        // watermark to the activation frontier so the first live round reads the tail only from
-        // rows its own mirror writes (the ring held another sequence's residue before).
-        const std::int32_t row =
-            text_kv_addresses->bound_row(*transaction.root_text_address);
-        if (row >= 0) {
-            const std::int32_t frontier =
-                static_cast<std::int32_t>(*transaction.text_activation_frontier);
-            CUDA_CHECK(cudaMemcpyAsync(
-                static_cast<std::int32_t*>(decoder->text_kv.tail_watermark().data) + row,
-                &frontier, sizeof(frontier), cudaMemcpyHostToDevice, device.transfer_stream));
-        }
-    }
     if (!transaction.backend_restores.empty()) {
         enqueue_kv(*backend_kv_pages, transaction.backend_restores,
                    transaction.backend_restore_destinations,
@@ -9751,6 +9736,19 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
             backend_kv_addresses->commit_activation(std::move(*transaction.backend_activation),
                                                     device.stream);
             transaction.backend_activation.reset();
+        }
+        if (decoder->text_kv.has_tail() && transaction.text_activation_frontier) {
+            // The row lease is live only after the commit above: prime this row's ring watermark
+            // to the activation frontier so the first live round reads the tail only from rows its
+            // own mirror writes (the ring held the previous row occupant's residue before).
+            const std::int32_t row = text_kv_addresses->bound_row(sequence.kv->text);
+            if (row >= 0) {
+                const std::int32_t frontier =
+                    static_cast<std::int32_t>(*transaction.text_activation_frontier);
+                CUDA_CHECK(cudaMemcpyAsync(
+                    static_cast<std::int32_t*>(decoder->text_kv.tail_watermark().data) + row,
+                    &frontier, sizeof(frontier), cudaMemcpyHostToDevice, device.stream));
+            }
         }
         transaction.prefix_forks_ready = false;
         transaction.text_activation_frontier.reset();

@@ -1687,6 +1687,98 @@ ninfer::RequestOptions fixed_output(std::uint32_t tokens, bool reuse = true) {
     return options;
 }
 
+// Precision-tail regression for prefix-reuse activation (kv_tail_tokens = 128 => a C = 192-row
+// ring). max_concurrency = 1 gives the text KV one table row: A runs first, the filler F runs
+// second and leaves its own mirrored K/V plus its stale ring watermark in that row, and B
+// re-activates A's full prefix on the same row. The activation must prime the row's watermark
+// to the reuse frontier; otherwise B's first decode round reads F's residue through the BF16
+// tail ring and the first token diverges from A's.
+int exercise_tail_primed_prefix_reuse(const char* artifact) {
+    ninfer::EngineOptions options;
+    options.artifact_path                        = artifact;
+    options.max_context                          = 1024;
+    options.kv_capacity                          =
+        ninfer::KvCapacityPolicy::explicit_capacity(2048);
+    options.prefill_chunk                        = 256;
+    options.kv_cache                             = ninfer::KvCacheStorage::Int8Group64;
+    options.kv_tail_tokens                       = 128;
+    options.speculative.backend                  = ninfer::SpeculativeBackend::None;
+    options.max_concurrency                      = 1;
+    options.max_pending_requests                 = 1;
+    options.context_cache.device_state_slots     = 2;
+    options.context_cache.max_private_continuations         = 2;
+    options.context_cache.max_shared_prefixes               = 0;
+    options.context_cache.max_long_anchors_per_continuation = 0;
+    ninfer::Engine engine(std::move(options));
+
+    std::string a_text;
+    for (int repetition = 0; repetition < 48; ++repetition) {
+        a_text += "The capital of Belgium is Brussels. ";
+    }
+    a_text += "The capital of France is";
+    const std::vector<ninfer::TokenId> a_prompt = engine.tokenize_text(a_text);
+    const std::uint32_t l_a = static_cast<std::uint32_t>(a_prompt.size());
+    if (l_a < 256 || l_a > 896) {
+        std::cerr << "tail-primed scenario geometry is invalid: L_A=" << l_a
+                  << " is outside [256, 896]\n";
+        return 1;
+    }
+
+    // A filler sharing no prefix with A, sized to land strictly inside (L_A, L_A + 96]: its
+    // final ring watermark (L_F + 8 - 192) then sits inside B's first-round tail region, and
+    // its mirrored K/V differs from A's across that region.
+    const std::string filler_sentence = "Photosynthesis converts light energy into chemical energy. ";
+    const std::uint32_t filler_len =
+        static_cast<std::uint32_t>(engine.tokenize_text(filler_sentence).size());
+    if (filler_len == 0 || filler_len > 96) {
+        std::cerr << "tail-primed filler tokenizes to " << filler_len
+                  << " tokens; expected (0, 96]\n";
+        return 1;
+    }
+    const std::uint32_t filler_repetitions = (l_a + 1U + filler_len - 1U) / filler_len;
+    std::string filler_text;
+    for (std::uint32_t repetition = 0; repetition < filler_repetitions; ++repetition) {
+        filler_text += filler_sentence;
+    }
+    const std::vector<ninfer::TokenId> filler_prompt = engine.tokenize_text(filler_text);
+    const std::uint32_t l_f = static_cast<std::uint32_t>(filler_prompt.size());
+    if (l_f <= l_a || l_f > l_a + 96U) {
+        std::cerr << "tail-primed filler drift is out of range: L_F=" << l_f << ", L_A=" << l_a
+                  << " (required L_A < L_F <= L_A + 96)\n";
+        return 1;
+    }
+
+    const ninfer::GenerationResult a =
+        engine.generate(engine.prepare_tokens(a_prompt), fixed_output(8));
+    if (a.generated_token_ids.size() != 8) {
+        std::cerr << "tail-primed scenario: A did not generate eight tokens\n";
+        return 1;
+    }
+    const ninfer::GenerationResult filler =
+        engine.generate(engine.prepare_tokens(filler_prompt), fixed_output(8));
+    if (filler.generated_token_ids.size() != 8) {
+        std::cerr << "tail-primed scenario: filler did not generate eight tokens\n";
+        return 1;
+    }
+    const ninfer::GenerationResult b =
+        engine.generate(engine.prepare_tokens(a_prompt), fixed_output(8));
+    if (b.reused_prompt_tokens != l_a) {
+        std::cerr << "tail-primed scenario: reuse did not fire, reused="
+                  << b.reused_prompt_tokens << ", expected " << l_a << '\n';
+        return 1;
+    }
+    if (b.generated_token_ids.size() != 8) {
+        std::cerr << "tail-primed scenario: B did not generate eight tokens\n";
+        return 1;
+    }
+    if (b.generated_token_ids[0] != a.generated_token_ids[0]) {
+        std::cerr << "tail-primed scenario: first token after tail-primed prefix reuse diverged "
+                     "from the retained prefix baseline (stale ring watermark read)\n";
+        return 1;
+    }
+    return 0;
+}
+
 int exercise_pressure_partial_spill_and_resume(const char* artifact) {
     constexpr std::uint32_t kLongPromptTokens  = 7683;
     constexpr std::uint32_t kLongOutputTokens  = 31;
@@ -2132,6 +2224,9 @@ int exercise_artifact(const char* artifact, std::string_view expected_target) {
         return result;
     }
     if (const int result = exercise_last_private_alias_eviction(artifact); result != 0) {
+        return result;
+    }
+    if (const int result = exercise_tail_primed_prefix_reuse(artifact); result != 0) {
         return result;
     }
     if (const int result = exercise_concurrent_resource_settlement(artifact, expected_target);
