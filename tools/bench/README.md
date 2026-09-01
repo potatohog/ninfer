@@ -1,7 +1,7 @@
 # tools/bench
 
 Maintainer orchestration for the public `ninfer_bench` throughput tool and the external Serve TTFT
-client. Correctness/parity tooling lives separately under [`tools/parity`](../parity).
+client. Correctness is owned by the affected suites under [`tests/`](../../tests/README.md).
 
 ## External Serve TTFT
 

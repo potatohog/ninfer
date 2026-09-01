@@ -97,15 +97,13 @@ Run the native Python suites with the project Python environment:
 
 ```bash
 python3 -m pytest \
-  tests/artifact tests/targets/qwen3_6_27b tests/targets/qwen3_6_35b_a3b \
+  tests/artifact tests/convert \
   tests/test_bench_matrix.py tests/test_serve_corpus.py
 ```
 
-The Python binding tests use `NINFER_QWEN3_6_27B_ARTIFACT` when set, otherwise they look for
-`out/qwen3_6_27b.ninfer`. They report a pytest skip when neither path provides the real
-artifact. The 35B-A3B reference binding test follows the same rule with
-`NINFER_QWEN3_6_35B_A3B_ARTIFACT` and `out/qwen3_6_35b_a3b.ninfer`. The remaining Python
-target tests still run without either artifact.
+The Python suites cover generic artifact framing and exact converter inventories, source recipes,
+encoders, and payload verification. Model execution and real-artifact binding are tested through
+the C++ target and Engine suites below; there is no Python inference implementation.
 
 The C++ prefix/MTP integration test is separately opt-in because it loads the full artifact and
 runs the real engine:
